@@ -787,6 +787,7 @@ class MainFrame(ttk.Frame):
         )
         self.user_list = UserList(self, on_select_user)
         self.invite_list = InviteList(self, on_accept_invite, on_decline_invite)
+        self.on_create_room = on_create_room
         self.on_create_chat = on_create_chat
         self.on_invite_room = on_invite_room
 
@@ -798,18 +799,38 @@ class MainFrame(ttk.Frame):
         layout.columnconfigure(2, weight=1)
         layout.rowconfigure(0, weight=1)
 
-        self.left_frame = ttk.Frame(layout, padding=12)
-        center = ttk.Frame(layout, padding=12)
-        right = ttk.Frame(layout, padding=12)
+        self.left_frame = ttk.Frame(layout, padding=12, relief="solid", borderwidth=1)
+        center = ttk.Frame(layout, padding=12, relief="solid", borderwidth=1)
+        right = ttk.Frame(layout, padding=12, relief="solid", borderwidth=1)
 
         self.left_frame.grid(row=0, column=0, sticky="nsew")
         center.grid(row=0, column=1, sticky="nsew")
         right.grid(row=0, column=2, sticky="nsew")
 
-        self.channel_list.pack(in_=self.left_frame, fill="both", expand=True)
+        self.channel_list.pack(in_=right, fill="x")
         self.chat_view.pack(in_=center, fill="both", expand=True)
 
-        self.user_list.pack(in_=right, fill="x")
+        self.user_list.pack(in_=self.left_frame, fill="x")
+
+        room_controls = ttk.LabelFrame(right, text="Новая комната")
+        room_controls.pack(fill="x", pady=(12, 0))
+        ttk.Label(room_controls, text="Название").grid(row=0, column=0, sticky="w")
+        ttk.Label(room_controls, text="Тип").grid(row=1, column=0, sticky="w")
+        self.new_room_name_var = tk.StringVar()
+        self.new_room_kind_var = tk.StringVar(value="text")
+        ttk.Entry(room_controls, textvariable=self.new_room_name_var).grid(
+            row=0, column=1, sticky="ew", padx=(6, 0)
+        )
+        ttk.Combobox(
+            room_controls,
+            textvariable=self.new_room_kind_var,
+            values=["text", "voice"],
+            state="readonly",
+        ).grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(4, 0))
+        ttk.Button(room_controls, text="Создать", command=self._handle_create_room).grid(
+            row=2, column=0, columnspan=2, pady=(6, 0)
+        )
+        room_controls.columnconfigure(1, weight=1)
 
         chat_controls = ttk.LabelFrame(right, text="New chat")
         chat_controls.pack(fill="x", pady=(12, 0))
@@ -854,6 +875,14 @@ class MainFrame(ttk.Frame):
         kind = self.chat_kind_var.get() or "text"
         self.on_create_chat(username, kind)
 
+    def _handle_create_room(self) -> None:
+        name = self.new_room_name_var.get().strip()
+        if not name:
+            return
+        kind = self.new_room_kind_var.get() or "text"
+        self.on_create_room(name, kind)
+        self.new_room_name_var.set("")
+
     def _handle_invite_room(self) -> None:
         username = self.user_list.selected_user()
         room = self.invite_room_var.get()
@@ -886,7 +915,7 @@ class App(tk.Tk):
         self.screen_share_job: Optional[str] = None
         self.screen_windows: dict[tuple[str, str], tk.Toplevel] = {}
 
-        self.login_frame = LoginFrame(self, self._login, self._register)
+        self.login_frame = LoginFrame(self, self._login, self._handle_register)
         self.main_frame = MainFrame(
             self,
             on_select_channel=self._select_channel,
@@ -919,7 +948,7 @@ class App(tk.Tk):
             return
         self.client.send({"action": "login", "username": username, "password": password})
 
-    def _register(self, username: str, password: str) -> None:
+    def _handle_register(self, username: str, password: str) -> None:
         if not username or not password:
             self.login_frame.set_status("Введите логин и пароль.")
             return
@@ -983,6 +1012,8 @@ class App(tk.Tk):
                 if room:
                     self.rooms.append({"room": room, "kind": kind})
                     self._refresh_channel_lists()
+                    self.main_frame.show_channels()
+                    self.client.send({"action": "list_rooms"})
         elif action == "join_room":
             if message.get("ok"):
                 room = message.get("room")
@@ -990,6 +1021,8 @@ class App(tk.Tk):
                 if room and not any(item.get("room") == room for item in self.rooms):
                     self.rooms.append({"room": room, "kind": kind})
                     self._refresh_channel_lists()
+                    self.main_frame.show_channels()
+                    self.client.send({"action": "list_rooms"})
         elif action == "create_chat":
             if message.get("ok"):
                 chat = message.get("chat")
@@ -1021,6 +1054,8 @@ class App(tk.Tk):
     def _show_main(self) -> None:
         self.login_frame.pack_forget()
         self.main_frame.pack(fill="both", expand=True)
+        self.main_frame.show_channels()
+        self.main_frame.chat_view.show_placeholder()
 
     def _show_login(self) -> None:
         self.main_frame.pack_forget()
@@ -1079,6 +1114,8 @@ class App(tk.Tk):
         self.main_frame.channel_list.update_rooms(room_channels)
         self.main_frame.channel_list.update_chats(chat_channels)
         self.main_frame.invite_room_combo["values"] = [room["room"] for room in self.rooms]
+        if self.selected_channel is None:
+            self.main_frame.show_channels()
 
     def _chat_label(self, chat_id: str, kind: str) -> str:
         if self.username and ":" in chat_id:
