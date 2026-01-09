@@ -702,11 +702,7 @@ class RCordApp:
         elif action == "list_messages":
             self.update_messages(message.get("messages", []))
         elif action == "invite_received":
-            handler = getattr(self, "handle_invite", None)
-            if handler:
-                handler(message)
-            else:
-                messagebox.showinfo("Invite", f"Получено приглашение: {message}")
+            self.handle_invite(message)
         elif action == "send_message":
             self.refresh_messages()
         elif action == "heartbeat":
@@ -1067,37 +1063,6 @@ class RCordApp:
         if not self.safe_send({"action": "invite_room", "room": room, "username": target}):
             return
         messagebox.showinfo("Invite", f"Приглашение отправлено: {target}")
-
-    def handle_invite(self, message: Dict[str, Any]) -> None:
-        invite_type = message.get("invite_type")
-        sender = message.get("from", "unknown")
-        if invite_type == "room":
-            room = message.get("room")
-            kind = message.get("kind", "text")
-            if not room:
-                return
-            accept = messagebox.askyesno(
-                "Invite",
-                f"Приглашение в комнату '{room}' ({kind}) от {sender}. Принять?",
-            )
-            if accept:
-                if self.safe_send({"action": "join_room", "room": room}):
-                    self.refresh_rooms()
-            else:
-                self.safe_send({"action": "decline_room_invite", "room": room})
-        elif invite_type == "chat":
-            chat_id = message.get("chat")
-            if not chat_id:
-                return
-            accept = messagebox.askyesno(
-                "Invite",
-                f"Приглашение в чат '{chat_id}' от {sender}. Принять?",
-            )
-            if accept:
-                if self.safe_send({"action": "accept_chat", "chat": chat_id}):
-                    self.refresh_chats()
-            else:
-                self.safe_send({"action": "decline_chat_invite", "chat": chat_id})
 
     def safe_send(self, payload: Dict[str, Any]) -> bool:
         try:
