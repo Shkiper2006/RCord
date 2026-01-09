@@ -443,7 +443,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         if username:
             state.set_offline(username)
         writer.close()
-        await writer.wait_closed()
+        with contextlib.suppress(ConnectionResetError, OSError):
+            await writer.wait_closed()
         print(f"Disconnected {peer}")
 
 
@@ -544,7 +545,8 @@ async def handle_media_client(
         if username:
             state.media_sessions.pop(username, None)
         writer.close()
-        await writer.wait_closed()
+        with contextlib.suppress(ConnectionResetError, OSError):
+            await writer.wait_closed()
         print(f"Media disconnected {peer}")
 
 
