@@ -39,6 +39,9 @@ COLORS = {
     "offline": "#4f545c",
 }
 
+HEARTBEAT_INTERVAL = int(os.getenv("RCORD_HEARTBEAT_INTERVAL", "25"))
+USERS_REFRESH_INTERVAL = int(os.getenv("RCORD_USERS_REFRESH_INTERVAL", "30"))
+
 
 def load_settings() -> Dict[str, Any]:
     if os.path.exists(SETTINGS_PATH):
@@ -438,6 +441,7 @@ class RCordApp:
         self.root.title("RCord Client")
         self.root.configure(bg=COLORS["bg"])
         self.root.geometry("1280x720")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.username: Optional[str] = None
         self.current_target: Optional[Dict[str, Any]] = None
         self.view_mode = "text"
@@ -452,6 +456,8 @@ class RCordApp:
         self.mic_enabled = False
         self.screen_share_enabled = False
         self.media_target: Optional[str] = None
+        self.heartbeat_after_id: Optional[str] = None
+        self.users_after_id: Optional[str] = None
 
         self.setup_styles()
 
@@ -508,6 +514,7 @@ class RCordApp:
         self.show_main_ui()
         self.apply_login_payload(response)
         self.start_media_session()
+        self.start_presence_tasks()
 
     def register(self, username: str, password: str) -> None:
         if not username or not password:
@@ -956,6 +963,54 @@ class RCordApp:
         if not self.current_target:
             return
         self.connection.send({"action": "list_members", **self.current_target})
+
+    def start_presence_tasks(self) -> None:
+        self.stop_presence_tasks()
+        self.schedule_heartbeat()
+        self.schedule_users_refresh()
+
+    def stop_presence_tasks(self) -> None:
+        if self.heartbeat_after_id:
+            self.root.after_cancel(self.heartbeat_after_id)
+            self.heartbeat_after_id = None
+        if self.users_after_id:
+            self.root.after_cancel(self.users_after_id)
+            self.users_after_id = None
+
+    def schedule_heartbeat(self) -> None:
+        if not self.username:
+            return
+        try:
+            self.connection.send({"action": "heartbeat"})
+        except RuntimeError:
+            return
+        self.heartbeat_after_id = self.root.after(HEARTBEAT_INTERVAL * 1000, self.schedule_heartbeat)
+
+    def schedule_users_refresh(self) -> None:
+        if not self.username:
+            return
+        try:
+            self.refresh_users()
+        except RuntimeError:
+            return
+        self.users_after_id = self.root.after(USERS_REFRESH_INTERVAL * 1000, self.schedule_users_refresh)
+
+    def on_close(self) -> None:
+        self.stop_presence_tasks()
+        if self.mic_enabled:
+            self.stop_mic_stream()
+        if self.screen_share_enabled:
+            self.stop_screen_share()
+        if self.media_client:
+            self.media_client.stop()
+            self.media_client = None
+        if self.username:
+            try:
+                self.connection.send({"action": "logout"})
+            except RuntimeError:
+                pass
+        self.connection.disconnect()
+        self.root.destroy()
 
     def run(self) -> None:
         self.root.mainloop()
