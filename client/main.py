@@ -787,6 +787,7 @@ class MainFrame(ttk.Frame):
         )
         self.user_list = UserList(self, on_select_user)
         self.invite_list = InviteList(self, on_accept_invite, on_decline_invite)
+        self.on_create_room = on_create_room
         self.on_create_chat = on_create_chat
         self.on_invite_room = on_invite_room
 
@@ -810,6 +811,26 @@ class MainFrame(ttk.Frame):
         self.chat_view.pack(in_=center, fill="both", expand=True)
 
         self.user_list.pack(in_=right, fill="x")
+
+        room_controls = ttk.LabelFrame(right, text="Новая комната")
+        room_controls.pack(fill="x", pady=(12, 0))
+        ttk.Label(room_controls, text="Название").grid(row=0, column=0, sticky="w")
+        ttk.Label(room_controls, text="Тип").grid(row=1, column=0, sticky="w")
+        self.new_room_name_var = tk.StringVar()
+        self.new_room_kind_var = tk.StringVar(value="text")
+        ttk.Entry(room_controls, textvariable=self.new_room_name_var).grid(
+            row=0, column=1, sticky="ew", padx=(6, 0)
+        )
+        ttk.Combobox(
+            room_controls,
+            textvariable=self.new_room_kind_var,
+            values=["text", "voice"],
+            state="readonly",
+        ).grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(4, 0))
+        ttk.Button(room_controls, text="Создать", command=self._handle_create_room).grid(
+            row=2, column=0, columnspan=2, pady=(6, 0)
+        )
+        room_controls.columnconfigure(1, weight=1)
 
         chat_controls = ttk.LabelFrame(right, text="New chat")
         chat_controls.pack(fill="x", pady=(12, 0))
@@ -854,6 +875,14 @@ class MainFrame(ttk.Frame):
         kind = self.chat_kind_var.get() or "text"
         self.on_create_chat(username, kind)
 
+    def _handle_create_room(self) -> None:
+        name = self.new_room_name_var.get().strip()
+        if not name:
+            return
+        kind = self.new_room_kind_var.get() or "text"
+        self.on_create_room(name, kind)
+        self.new_room_name_var.set("")
+
     def _handle_invite_room(self) -> None:
         username = self.user_list.selected_user()
         room = self.invite_room_var.get()
@@ -886,7 +915,7 @@ class App(tk.Tk):
         self.screen_share_job: Optional[str] = None
         self.screen_windows: dict[tuple[str, str], tk.Toplevel] = {}
 
-        self.login_frame = LoginFrame(self, self._login, self._register)
+        self.login_frame = LoginFrame(self, self._login, self._handle_register)
         self.main_frame = MainFrame(
             self,
             on_select_channel=self._select_channel,
@@ -919,7 +948,7 @@ class App(tk.Tk):
             return
         self.client.send({"action": "login", "username": username, "password": password})
 
-    def _register(self, username: str, password: str) -> None:
+    def _handle_register(self, username: str, password: str) -> None:
         if not username or not password:
             self.login_frame.set_status("Введите логин и пароль.")
             return
