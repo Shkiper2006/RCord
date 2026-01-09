@@ -2,7 +2,7 @@ import json
 import os
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from typing import Any, Dict, List, Optional
 
@@ -26,6 +26,7 @@ class Storage:
         self._path = config.path
         self._lock = threading.Lock()
         self._ensure_file()
+        self._invite_ttl = timedelta(seconds=300)
 
     @staticmethod
     def _default_data() -> Dict[str, Any]:
@@ -139,8 +140,11 @@ class Storage:
     def add_room_member(self, room: str, username: str) -> bool:
         with self._lock:
             data = self._read()
+            expired = self._remove_expired_invites(data, username)
             room_data = data["rooms"].get(room)
             if not room_data:
+                if expired["rooms"] or expired["chats"]:
+                    self._write(data)
                 return False
             if username not in room_data["members"]:
                 room_data["members"].append(username)
@@ -274,12 +278,18 @@ class Storage:
         normalized.sort(key=lambda item: item["chat"] or "")
         return normalized
 
-    def accept_chat_invite(self, username: str, chat_id: str) -> bool:
+    def accept_chat_invite(self, username: str, chat_id: str) -> tuple[bool, bool]:
         with self._lock:
             data = self._read()
+            expired = self._remove_expired_invites(data, username)
+            if chat_id in expired["chats"]:
+                self._write(data)
+                return False, True
             chat = data["chats"].get(chat_id)
             if not chat:
-                return False
+                if expired["rooms"] or expired["chats"]:
+                    self._write(data)
+                return False, False
             if username not in chat["participants"]:
                 chat["participants"].append(username)
                 chat["participants"] = sorted(set(chat["participants"]))
@@ -289,7 +299,7 @@ class Storage:
             if chat_id in invites["chats"]:
                 invites["chats"].remove(chat_id)
             self._write(data)
-            return True
+            return True, False
 
     def remove_room_invite(self, username: str, room: str) -> bool:
         with self._lock:
@@ -325,25 +335,83 @@ class Storage:
                 return True
             return False
 
-    def has_room_invite(self, username: str, room: str) -> bool:
-        data = self._read()
-        invites = data["invites"]["users"].get(username, {}).get("rooms", [])
-        for invite in invites:
-            if isinstance(invite, dict) and invite.get("room") == room:
-                return True
-            if isinstance(invite, str) and invite == room:
-                return True
-        return False
+    def has_room_invite(self, username: str, room: str) -> tuple[bool, bool]:
+        with self._lock:
+            data = self._read()
+            expired = self._remove_expired_invites(data, username)
+            invites = data["invites"]["users"].get(username, {}).get("rooms", [])
+            has_invite = False
+            for invite in invites:
+                if isinstance(invite, dict) and invite.get("room") == room:
+                    has_invite = True
+                    break
+                if isinstance(invite, str) and invite == room:
+                    has_invite = True
+                    break
+            if expired["rooms"] or expired["chats"]:
+                self._write(data)
+            return has_invite, room in expired["rooms"]
 
-    def has_chat_invite(self, username: str, chat_id: str) -> bool:
-        data = self._read()
-        invites = data["invites"]["users"].get(username, {}).get("chats", [])
-        for invite in invites:
-            if isinstance(invite, dict) and invite.get("chat") == chat_id:
-                return True
-            if isinstance(invite, str) and invite == chat_id:
-                return True
-        return False
+    def has_chat_invite(self, username: str, chat_id: str) -> tuple[bool, bool]:
+        with self._lock:
+            data = self._read()
+            expired = self._remove_expired_invites(data, username)
+            invites = data["invites"]["users"].get(username, {}).get("chats", [])
+            has_invite = False
+            for invite in invites:
+                if isinstance(invite, dict) and invite.get("chat") == chat_id:
+                    has_invite = True
+                    break
+                if isinstance(invite, str) and invite == chat_id:
+                    has_invite = True
+                    break
+            if expired["rooms"] or expired["chats"]:
+                self._write(data)
+            return has_invite, chat_id in expired["chats"]
+
+    def cleanup_expired_invites(self, username: str) -> Dict[str, List[str]]:
+        with self._lock:
+            data = self._read()
+            expired = self._remove_expired_invites(data, username)
+            if expired["rooms"] or expired["chats"]:
+                self._write(data)
+            return expired
+
+    def _remove_expired_invites(self, data: Dict[str, Any], username: str) -> Dict[str, List[str]]:
+        now = datetime.now(timezone.utc)
+        expired: Dict[str, List[str]] = {"rooms": [], "chats": []}
+        invites = data["invites"]["users"].setdefault(username, {"rooms": [], "chats": []})
+        cleaned_rooms = []
+        for invite in invites.get("rooms", []):
+            if self._is_invite_expired(invite, now):
+                if isinstance(invite, dict) and invite.get("room"):
+                    expired["rooms"].append(invite["room"])
+                continue
+            cleaned_rooms.append(invite)
+        cleaned_chats = []
+        for invite in invites.get("chats", []):
+            if self._is_invite_expired(invite, now):
+                if isinstance(invite, dict) and invite.get("chat"):
+                    expired["chats"].append(invite["chat"])
+                continue
+            cleaned_chats.append(invite)
+        invites["rooms"] = cleaned_rooms
+        invites["chats"] = cleaned_chats
+        return expired
+
+    def _is_invite_expired(self, invite: Any, now: datetime) -> bool:
+        if not isinstance(invite, dict):
+            return False
+        invited_at = invite.get("invited_at")
+        if not invited_at:
+            return False
+        try:
+            parsed = datetime.fromisoformat(invited_at)
+        except ValueError:
+            return False
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return now - parsed > self._invite_ttl
 
     def add_message(self, target: str, sender: str, payload: Dict[str, Any]) -> None:
         with self._lock:

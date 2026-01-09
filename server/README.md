@@ -55,3 +55,18 @@ Message kinds:
 - `text` uses `{text}`
 - `file` uses `{filename, content}` (base64)
 - `image` uses `{filename, content}` (base64)
+
+## Invite expiration
+
+Room and chat invites expire 5 minutes after `invited_at` (UTC). Expired invites
+are removed automatically during invite listing and invite validation.
+
+### Manual test scenario
+
+1. Start the server and register two users (e.g., `alice`, `bob`).
+2. Create a room as `alice` and invite `bob`.
+3. Verify `bob` sees the invite via `list_invites`.
+4. Edit `DB.dat` and set the invite's `invited_at` to more than 5 minutes ago
+   (e.g., `2020-01-01T00:00:00+00:00`).
+5. Call `list_invites` or attempt `join_room`/`accept_chat` as `bob` and confirm
+   the invite is removed and the response indicates `invite_expired`.

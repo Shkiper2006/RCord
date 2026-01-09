@@ -154,16 +154,21 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 if not username:
                     await send(writer, {"ok": False, "error": "not_authenticated"})
                     continue
+                expired = state.storage.cleanup_expired_invites(username)
+                response: Dict[str, Any] = {
+                    "ok": True,
+                    "action": "list_invites",
+                    "expired": expired,
+                    "invites": {
+                        "rooms": state.storage.list_room_invites(username),
+                        "chats": state.storage.list_chat_invites(username),
+                    },
+                }
+                if expired["rooms"] or expired["chats"]:
+                    response["error"] = "invite_expired"
                 await send(
                     writer,
-                    {
-                        "ok": True,
-                        "action": "list_invites",
-                        "invites": {
-                            "rooms": state.storage.list_room_invites(username),
-                            "chats": state.storage.list_chat_invites(username),
-                        },
-                    },
+                    response,
                 )
             elif action == "create_room":
                 if not username:
@@ -192,9 +197,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 if not room:
                     await send(writer, {"ok": False, "error": "missing_room"})
                     continue
-                if not state.storage.has_room_invite(username, room) and not state.storage.room_has_member(
-                    room, username
-                ):
+                has_invite, invite_expired = state.storage.has_room_invite(username, room)
+                if invite_expired:
+                    await send(writer, {"ok": False, "error": "invite_expired"})
+                    continue
+                if not has_invite and not state.storage.room_has_member(room, username):
                     await send(writer, {"ok": False, "error": "invite_required"})
                     continue
                 joined = state.storage.add_room_member(room, username)
@@ -288,7 +295,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 if not chat_id:
                     await send(writer, {"ok": False, "error": "missing_chat"})
                     continue
-                accepted = state.storage.accept_chat_invite(username, chat_id)
+                accepted, invite_expired = state.storage.accept_chat_invite(username, chat_id)
+                if invite_expired:
+                    await send(writer, {"ok": False, "error": "invite_expired"})
+                    continue
                 await send(
                     writer,
                     {
