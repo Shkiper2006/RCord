@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from config import CHECK_INTERVAL, DB_PATH, HEARTBEAT_TIMEOUT, HOST, PORT
+from config import CHECK_INTERVAL, DB_PATH, HEARTBEAT_TIMEOUT, HOST, MEDIA_PORT, PORT
 from storage import Storage, StorageConfig
 
 
@@ -25,6 +25,7 @@ class ServerState:
     storage: Storage
     sessions: Dict[str, Session] = field(default_factory=dict)
     status: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    media_sessions: Dict[str, asyncio.StreamWriter] = field(default_factory=dict)
 
     def set_online(self, username: str, writer: asyncio.StreamWriter) -> None:
         self.sessions[username] = Session(username=username, writer=writer)
@@ -33,6 +34,10 @@ class ServerState:
     def set_offline(self, username: str) -> None:
         if username in self.sessions:
             self.sessions.pop(username, None)
+        if username in self.media_sessions:
+            writer = self.media_sessions.pop(username, None)
+            if writer:
+                writer.close()
         self.status[username] = {"online": False, "last_seen": utc_now()}
 
     def touch(self, username: str) -> None:
@@ -384,6 +389,36 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     continue
                 messages = state.storage.list_messages(target, limit=limit)
                 await send(writer, {"ok": True, "action": "list_messages", "target": target, "messages": messages})
+            elif action == "list_members":
+                if not username:
+                    await send(writer, {"ok": False, "error": "not_authenticated"})
+                    continue
+                room = message.get("room")
+                chat = message.get("chat")
+                if room:
+                    if not state.storage.room_has_member(room, username):
+                        await send(writer, {"ok": False, "error": "not_room_member"})
+                        continue
+                    target = f"room:{room}"
+                    members = state.storage.get_room_members(room)
+                elif chat:
+                    if not state.storage.chat_has_member(chat, username):
+                        await send(writer, {"ok": False, "error": "not_chat_member"})
+                        continue
+                    target = f"chat:{chat}"
+                    members = state.storage.get_chat_members(chat)
+                else:
+                    await send(writer, {"ok": False, "error": "missing_target"})
+                    continue
+                await send(
+                    writer,
+                    {
+                        "ok": True,
+                        "action": "list_members",
+                        "target": target,
+                        "members": members,
+                    },
+                )
             elif action == "logout":
                 await send(writer, {"ok": True, "action": "logout"})
                 break
@@ -397,6 +432,107 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         writer.close()
         await writer.wait_closed()
         print(f"Disconnected {peer}")
+
+
+async def broadcast_media(
+    state: ServerState, recipients: list[str], payload: Dict[str, Any], sender: str
+) -> None:
+    tasks = []
+    for user in recipients:
+        if user == sender:
+            continue
+        writer = state.media_sessions.get(user)
+        if writer:
+            tasks.append(send(writer, payload))
+    if tasks:
+        await asyncio.gather(*tasks)
+
+
+async def handle_media_client(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, state: ServerState
+) -> None:
+    peer = writer.get_extra_info("peername")
+    username: Optional[str] = None
+    try:
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            message = parse_message(line)
+            if message is None:
+                await send(writer, {"ok": False, "error": "invalid_json"})
+                continue
+            action = message.get("action")
+            if action == "media_login":
+                user = message.get("username")
+                if not user or user not in state.sessions:
+                    await send(writer, {"ok": False, "error": "not_authenticated"})
+                    continue
+                username = user
+                state.media_sessions[user] = writer
+                await send(writer, {"ok": True, "action": "media_login"})
+            elif action == "voice_chunk":
+                if not username:
+                    await send(writer, {"ok": False, "error": "not_authenticated"})
+                    continue
+                target = message.get("target")
+                audio = message.get("audio")
+                if not target or not audio:
+                    await send(writer, {"ok": False, "error": "missing_payload"})
+                    continue
+                if target.startswith("room:"):
+                    room = target.split(":", 1)[1]
+                    if not state.storage.room_has_member(room, username):
+                        await send(writer, {"ok": False, "error": "not_room_member"})
+                        continue
+                    recipients = state.storage.get_room_members(room)
+                elif target.startswith("chat:"):
+                    chat = target.split(":", 1)[1]
+                    if not state.storage.chat_has_member(chat, username):
+                        await send(writer, {"ok": False, "error": "not_chat_member"})
+                        continue
+                    recipients = state.storage.get_chat_members(chat)
+                else:
+                    await send(writer, {"ok": False, "error": "unknown_target"})
+                    continue
+                payload = {"action": "voice_chunk", "from": username, "target": target, "audio": audio}
+                await broadcast_media(state, recipients, payload, username)
+            elif action == "screen_frame":
+                if not username:
+                    await send(writer, {"ok": False, "error": "not_authenticated"})
+                    continue
+                target = message.get("target")
+                frame = message.get("frame")
+                if not target or not frame:
+                    await send(writer, {"ok": False, "error": "missing_payload"})
+                    continue
+                if target.startswith("room:"):
+                    room = target.split(":", 1)[1]
+                    if not state.storage.room_has_member(room, username):
+                        await send(writer, {"ok": False, "error": "not_room_member"})
+                        continue
+                    recipients = state.storage.get_room_members(room)
+                elif target.startswith("chat:"):
+                    chat = target.split(":", 1)[1]
+                    if not state.storage.chat_has_member(chat, username):
+                        await send(writer, {"ok": False, "error": "not_chat_member"})
+                        continue
+                    recipients = state.storage.get_chat_members(chat)
+                else:
+                    await send(writer, {"ok": False, "error": "unknown_target"})
+                    continue
+                payload = {"action": "screen_frame", "from": username, "target": target, "frame": frame}
+                await broadcast_media(state, recipients, payload, username)
+            else:
+                await send(writer, {"ok": False, "error": "unknown_action"})
+    except asyncio.CancelledError:
+        raise
+    finally:
+        if username:
+            state.media_sessions.pop(username, None)
+        writer.close()
+        await writer.wait_closed()
+        print(f"Media disconnected {peer}")
 
 
 async def monitor_sessions(state: ServerState) -> None:
@@ -421,6 +557,9 @@ async def main() -> None:
     server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, state), HOST, PORT
     )
+    media_server = await asyncio.start_server(
+        lambda r, w: handle_media_client(r, w, state), HOST, MEDIA_PORT
+    )
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
@@ -433,9 +572,11 @@ async def main() -> None:
 
     monitor_task = asyncio.create_task(monitor_sessions(state))
     addr = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
+    media_addr = ", ".join(str(sock.getsockname()) for sock in media_server.sockets or [])
     print(f"Server listening on {addr}")
+    print(f"Media server listening on {media_addr}")
 
-    async with server:
+    async with server, media_server:
         await stop_event.wait()
 
     monitor_task.cancel()

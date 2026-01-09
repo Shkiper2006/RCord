@@ -1,20 +1,36 @@
 import base64
+import importlib
+import importlib.util
+import io
 import json
 import os
 import queue
 import socket
 import threading
+import time
 import tkinter as tk
+from array import array
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from tkinter import filedialog, ttk
 from typing import Any, Callable, Optional
 
 
+def load_optional_module(name: str) -> Optional[Any]:
+    if importlib.util.find_spec(name) is None:
+        return None
+    return importlib.import_module(name)
+
+
+sounddevice = load_optional_module("sounddevice")
+imagegrab_module = load_optional_module("PIL.ImageGrab")
+
+
 @dataclass
 class ClientConfig:
     host: str
     port: int
+    media_port: int
 
 
 class RcordClient:
@@ -63,6 +79,155 @@ class RcordClient:
         if self.socket:
             self.socket.close()
         self.socket = None
+
+
+class MediaClient:
+    def __init__(self, config: ClientConfig, inbox: queue.Queue) -> None:
+        self.config = config
+        self.inbox = inbox
+        self.socket: Optional[socket.socket] = None
+        self.reader: Optional[Any] = None
+        self.writer: Optional[Any] = None
+        self.thread: Optional[threading.Thread] = None
+        self.lock = threading.Lock()
+
+    def connect(self) -> None:
+        if self.socket:
+            return
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((self.config.host, self.config.media_port))
+        self.socket = sock
+        self.reader = sock.makefile("r", encoding="utf-8")
+        self.writer = sock.makefile("w", encoding="utf-8")
+        self.thread = threading.Thread(target=self._read_loop, daemon=True)
+        self.thread.start()
+
+    def _read_loop(self) -> None:
+        assert self.reader is not None
+        for line in self.reader:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload["source"] = "media"
+            self.inbox.put(payload)
+        self.inbox.put({"action": "media_connection_closed", "source": "media"})
+
+    def send(self, payload: dict[str, Any]) -> None:
+        self.connect()
+        assert self.writer is not None
+        data = json.dumps(payload, ensure_ascii=False)
+        with self.lock:
+            self.writer.write(data + "\n")
+            self.writer.flush()
+
+    def close(self) -> None:
+        if self.socket:
+            self.socket.close()
+        self.socket = None
+
+
+class VoiceEngine:
+    def __init__(self) -> None:
+        self.sample_rate = 16000
+        self.channels = 1
+        self.sample_width = 2
+        self.input_stream = None
+        self.output_stream = None
+        self.device: Optional[int] = None
+        self.muted = False
+        self.on_audio_chunk: Optional[Callable[[bytes, float], None]] = None
+        self.output_buffer = bytearray()
+        self.output_lock = threading.Lock()
+
+    def set_device(self, device: Optional[int]) -> None:
+        self.device = device
+        if self.input_stream is not None:
+            self.stop_input()
+            self.start_input()
+
+    def set_muted(self, muted: bool) -> None:
+        self.muted = muted
+
+    def start_input(self) -> None:
+        if self.input_stream is not None or sounddevice is None:
+            return
+        self.input_stream = sounddevice.RawInputStream(
+            samplerate=self.sample_rate,
+            blocksize=1024,
+            dtype="int16",
+            channels=self.channels,
+            device=self.device,
+            callback=self._on_input,
+        )
+        self.input_stream.start()
+
+    def stop_input(self) -> None:
+        if self.input_stream is None:
+            return
+        self.input_stream.stop()
+        self.input_stream.close()
+        self.input_stream = None
+
+    def start_output(self) -> None:
+        if self.output_stream is not None or sounddevice is None:
+            return
+        self.output_stream = sounddevice.RawOutputStream(
+            samplerate=self.sample_rate,
+            blocksize=1024,
+            dtype="int16",
+            channels=self.channels,
+            callback=self._on_output,
+        )
+        self.output_stream.start()
+
+    def stop_output(self) -> None:
+        if self.output_stream is None:
+            return
+        self.output_stream.stop()
+        self.output_stream.close()
+        self.output_stream = None
+        with self.output_lock:
+            self.output_buffer.clear()
+
+    def enqueue_output(self, data: bytes) -> None:
+        if self.output_stream is None:
+            self.start_output()
+        with self.output_lock:
+            self.output_buffer.extend(data)
+
+    def _on_input(self, indata: Any, frames: int, time_info: Any, status: Any) -> None:
+        _ = frames, time_info, status
+        if self.muted or self.on_audio_chunk is None:
+            return
+        data = bytes(indata)
+        amplitude = self._calculate_level(data)
+        self.on_audio_chunk(data, amplitude)
+
+    def _on_output(self, outdata: Any, frames: int, time_info: Any, status: Any) -> None:
+        _ = time_info, status
+        bytes_needed = frames * self.channels * self.sample_width
+        with self.output_lock:
+            if len(self.output_buffer) >= bytes_needed:
+                chunk = self.output_buffer[:bytes_needed]
+                del self.output_buffer[:bytes_needed]
+            else:
+                chunk = bytes(self.output_buffer)
+                self.output_buffer.clear()
+        if len(chunk) < bytes_needed:
+            chunk += b"\x00" * (bytes_needed - len(chunk))
+        outdata[:] = chunk
+
+    def _calculate_level(self, data: bytes) -> float:
+        if not data:
+            return 0.0
+        samples = array("h")
+        samples.frombytes(data)
+        peak = max(abs(sample) for sample in samples) if samples else 0
+        return peak / 32768.0
 
 
 class LoginFrame(ttk.Frame):
@@ -326,6 +491,134 @@ class InviteList(ttk.Frame):
         return f"Chat: {invite.target} ({invite.kind}){from_part}"
 
 
+class VoiceParticipantTile(tk.Frame):
+    def __init__(self, master: tk.Misc, username: str) -> None:
+        super().__init__(
+            master,
+            width=80,
+            height=80,
+            highlightthickness=2,
+            highlightbackground="#bdc3c7",
+        )
+        self.username = username
+        self.pack_propagate(False)
+        label = ttk.Label(self, text=username, anchor="center")
+        label.pack(fill="both", expand=True)
+
+    def set_active(self, active: bool) -> None:
+        color = "#2ecc71" if active else "#bdc3c7"
+        self.configure(highlightbackground=color, highlightcolor=color)
+
+
+class VoicePanel(ttk.LabelFrame):
+    def __init__(
+        self,
+        master: tk.Misc,
+        on_toggle_mic: Callable[[bool], None],
+        on_select_device: Callable[[Optional[int]], None],
+        on_toggle_screen: Callable[[bool], None],
+    ) -> None:
+        super().__init__(master, text="Voice")
+        self.on_toggle_mic = on_toggle_mic
+        self.on_select_device = on_select_device
+        self.on_toggle_screen = on_toggle_screen
+        self.device_var = tk.StringVar()
+        self.mic_var = tk.BooleanVar(value=True)
+        self.screen_var = tk.BooleanVar(value=False)
+        self.tiles: dict[str, VoiceParticipantTile] = {}
+        self.devices: list[tuple[str, Optional[int]]] = []
+
+        controls = ttk.Frame(self)
+        controls.pack(fill="x")
+
+        ttk.Checkbutton(
+            controls,
+            text="Microphone",
+            variable=self.mic_var,
+            command=self._handle_mic_toggle,
+        ).grid(row=0, column=0, sticky="w")
+
+        ttk.Checkbutton(
+            controls,
+            text="Screen share",
+            variable=self.screen_var,
+            command=self._handle_screen_toggle,
+        ).grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+        ttk.Label(controls, text="Input device").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.device_combo = ttk.Combobox(
+            controls, textvariable=self.device_var, state="readonly", width=40
+        )
+        self.device_combo.grid(row=1, column=1, sticky="ew", padx=(12, 0), pady=(6, 0))
+        self.device_combo.bind("<<ComboboxSelected>>", self._handle_device_select)
+        controls.columnconfigure(1, weight=1)
+
+        self.notice_var = tk.StringVar()
+        self.notice_label = ttk.Label(self, textvariable=self.notice_var, foreground="#7f8c8d")
+        self.notice_label.pack(anchor="w", pady=(6, 0))
+
+        self.participants_frame = ttk.Frame(self)
+        self.participants_frame.pack(fill="both", expand=True, pady=(8, 0))
+
+    def set_notice(self, text: str) -> None:
+        self.notice_var.set(text)
+
+    def set_devices(self, devices: list[tuple[str, Optional[int]]]) -> None:
+        self.devices = devices
+        labels = [label for label, _ in devices]
+        self.device_combo["values"] = labels
+        if labels:
+            self.device_combo.state(["!disabled"])
+            self.device_var.set(labels[0])
+        else:
+            self.device_combo.state(["disabled"])
+            self.device_var.set("")
+
+    def set_device_label(self, label: str) -> None:
+        self.device_var.set(label)
+
+    def set_mic_enabled(self, enabled: bool) -> None:
+        self.mic_var.set(enabled)
+
+    def set_screen_enabled(self, enabled: bool) -> None:
+        self.screen_var.set(enabled)
+
+    def render_participants(self, usernames: list[str]) -> None:
+        for child in self.participants_frame.winfo_children():
+            child.destroy()
+        self.tiles.clear()
+        columns = 3
+        for index, username in enumerate(usernames):
+            tile = VoiceParticipantTile(self.participants_frame, username)
+            row, col = divmod(index, columns)
+            tile.grid(row=row, column=col, padx=6, pady=6, sticky="nsew")
+            self.tiles[username] = tile
+        for col in range(columns):
+            self.participants_frame.columnconfigure(col, weight=1)
+
+    def set_activity(self, username: str, active: bool) -> None:
+        tile = self.tiles.get(username)
+        if tile:
+            tile.set_active(active)
+
+    def _handle_mic_toggle(self) -> None:
+        self.on_toggle_mic(self.mic_var.get())
+
+    def _handle_device_select(self, event: tk.Event) -> None:
+        _ = event
+        label = self.device_var.get()
+        self.on_select_device(self._device_index_for_label(label))
+
+    def _device_index_for_label(self, label: str) -> Optional[int]:
+        for device_label, device_index in self.devices:
+            if device_label == label:
+                return device_index
+        return None
+
+    def _handle_screen_toggle(self) -> None:
+        self.on_toggle_screen(self.screen_var.get())
+
+
 class ChatView(ttk.Frame):
     def __init__(
         self,
@@ -333,6 +626,9 @@ class ChatView(ttk.Frame):
         on_show_channels: Callable[[], None],
         on_send_text: Callable[[str], None],
         on_send_attachment: Callable[[str], None],
+        on_toggle_mic: Callable[[bool], None],
+        on_select_device: Callable[[Optional[int]], None],
+        on_toggle_screen: Callable[[bool], None],
     ) -> None:
         super().__init__(master)
         self.on_send_text = on_send_text
@@ -377,6 +673,15 @@ class ChatView(ttk.Frame):
                 self.emoji_frame, text=emoji, width=3, command=lambda e=emoji: self._insert_emoji(e)
             ).pack(side="left", padx=2, pady=2)
 
+        self.voice_panel = VoicePanel(
+            self,
+            on_toggle_mic=on_toggle_mic,
+            on_select_device=on_select_device,
+            on_toggle_screen=on_toggle_screen,
+        )
+        self.voice_panel.pack(fill="x", pady=(12, 0))
+        self.voice_panel.pack_forget()
+
         self.set_input_enabled(False)
 
     def set_input_enabled(self, enabled: bool) -> None:
@@ -412,6 +717,7 @@ class ChatView(ttk.Frame):
         self.messages.delete(0, tk.END)
         self.show_channels_button.pack_forget()
         self.set_input_enabled(False)
+        self.voice_panel.pack_forget()
 
     def show_channel(self, title: str) -> None:
         self.title_var.set(title)
@@ -437,6 +743,18 @@ class ChatView(ttk.Frame):
                 rendered = message.get("text", "")
             self.messages.insert(tk.END, f"{sender}: {rendered}")
 
+    def show_voice_panel(self) -> None:
+        self.voice_panel.pack(fill="x", pady=(12, 0))
+
+    def hide_voice_panel(self) -> None:
+        self.voice_panel.pack_forget()
+
+    def update_voice_participants(self, usernames: list[str]) -> None:
+        self.voice_panel.render_participants(usernames)
+
+    def set_voice_activity(self, username: str, active: bool) -> None:
+        self.voice_panel.set_activity(username, active)
+
 
 class MainFrame(ttk.Frame):
     def __init__(
@@ -447,6 +765,9 @@ class MainFrame(ttk.Frame):
         on_show_channels: Callable[[], None],
         on_send_text: Callable[[str], None],
         on_send_attachment: Callable[[str], None],
+        on_toggle_mic: Callable[[bool], None],
+        on_select_device: Callable[[Optional[int]], None],
+        on_toggle_screen: Callable[[bool], None],
         on_select_user: Callable[[Optional[str]], None],
         on_create_chat: Callable[[str, str], None],
         on_invite_room: Callable[[str, str], None],
@@ -455,7 +776,15 @@ class MainFrame(ttk.Frame):
     ) -> None:
         super().__init__(master)
         self.channel_list = ChannelList(self, on_select_channel, on_create_room)
-        self.chat_view = ChatView(self, on_show_channels, on_send_text, on_send_attachment)
+        self.chat_view = ChatView(
+            self,
+            on_show_channels,
+            on_send_text,
+            on_send_attachment,
+            on_toggle_mic,
+            on_select_device,
+            on_toggle_screen,
+        )
         self.user_list = UserList(self, on_select_user)
         self.invite_list = InviteList(self, on_accept_invite, on_decline_invite)
         self.on_create_chat = on_create_chat
@@ -541,11 +870,21 @@ class App(tk.Tk):
 
         self.queue: queue.Queue = queue.Queue()
         self.client = RcordClient(config, self.queue)
+        self.media_client = MediaClient(config, self.queue)
         self.username: Optional[str] = None
         self.users: list[dict[str, Any]] = []
         self.rooms: list[dict[str, Any]] = []
         self.chats: list[dict[str, Any]] = []
         self.invites: dict[tuple[str, str], Invite] = {}
+        self.voice_channel: Optional[Channel] = None
+        self.voice_members: list[str] = []
+        self.voice_activity: dict[str, float] = {}
+        self.voice_engine = VoiceEngine() if sounddevice is not None else None
+        self.selected_input_device: Optional[int] = None
+        self.screen_sharing = False
+        self.screen_share_target: Optional[str] = None
+        self.screen_share_job: Optional[str] = None
+        self.screen_windows: dict[tuple[str, str], tk.Toplevel] = {}
 
         self.login_frame = LoginFrame(self, self._login, self._register)
         self.main_frame = MainFrame(
@@ -555,6 +894,9 @@ class App(tk.Tk):
             on_show_channels=self._show_channels,
             on_send_text=self._send_text_message,
             on_send_attachment=self._send_attachment,
+            on_toggle_mic=self._toggle_mic,
+            on_select_device=self._select_input_device,
+            on_toggle_screen=self._toggle_screen_share,
             on_select_user=self._select_user,
             on_create_chat=self._create_chat,
             on_invite_room=self._invite_room,
@@ -569,6 +911,7 @@ class App(tk.Tk):
         self.after(5000, self._refresh_users)
         self.after(30000, self._heartbeat)
         self.after(1000, self._tick_invites)
+        self.after(200, self._tick_voice_activity)
 
     def _login(self, username: str, password: str) -> None:
         if not username or not password:
@@ -592,6 +935,9 @@ class App(tk.Tk):
         self.after(200, self._process_queue)
 
     def _handle_message(self, message: dict[str, Any]) -> None:
+        if message.get("source") == "media":
+            self._handle_media_message(message)
+            return
         action = message.get("action")
         if action == "register":
             if message.get("ok"):
@@ -610,6 +956,9 @@ class App(tk.Tk):
                 self.main_frame.user_list.update_users(users)
                 self._refresh_channel_lists()
                 self._load_invites(invites)
+                self._configure_voice_panel()
+                if self.username:
+                    self.media_client.send({"action": "media_login", "username": self.username})
             else:
                 error = message.get("error", "Ошибка входа")
                 self.login_frame.set_status(f"Ошибка: {error}")
@@ -660,10 +1009,14 @@ class App(tk.Tk):
                 expected = self._channel_target(self.selected_channel)
                 if message.get("target") == expected:
                     self.main_frame.chat_view.update_messages(message.get("messages", []))
+        elif action == "list_members":
+            self._handle_member_list(message)
         elif action == "connection_closed":
             self.login_frame.set_status("Соединение закрыто.")
             self.username = None
             self._show_login()
+        elif action == "media_connection_closed":
+            self.login_frame.set_status("Медиа-соединение закрыто.")
 
     def _show_main(self) -> None:
         self.login_frame.pack_forget()
@@ -672,6 +1025,28 @@ class App(tk.Tk):
     def _show_login(self) -> None:
         self.main_frame.pack_forget()
         self.login_frame.pack(expand=True)
+        self._leave_voice_channel()
+
+    def _configure_voice_panel(self) -> None:
+        if sounddevice is None:
+            self.main_frame.chat_view.voice_panel.set_notice(
+                "Аудио недоступно: установите sounddevice."
+            )
+            self.main_frame.chat_view.voice_panel.set_devices([])
+            return
+        devices = []
+        for index, info in enumerate(sounddevice.query_devices()):  # type: ignore[union-attr]
+            if info.get("max_input_channels", 0) > 0:
+                label = f"{info.get('name', 'Device')} (#{index})"
+                devices.append((label, index))
+        self.main_frame.chat_view.voice_panel.set_devices(devices)
+        if devices:
+            self.selected_input_device = devices[0][1]
+            self.main_frame.chat_view.voice_panel.set_device_label(devices[0][0])
+            self.main_frame.chat_view.voice_panel.set_notice("")
+        else:
+            self.selected_input_device = None
+            self.main_frame.chat_view.voice_panel.set_notice("Нет доступных устройств ввода.")
 
     def _refresh_users(self) -> None:
         if self.username:
@@ -800,6 +1175,10 @@ class App(tk.Tk):
         title = f"{channel.label}"
         self.main_frame.chat_view.show_channel(title)
         self.main_frame.hide_channels()
+        if channel.kind == "voice":
+            self._enter_voice_channel(channel)
+        else:
+            self._leave_voice_channel()
         if channel.channel_type == "room":
             self.client.send({"action": "list_messages", "room": channel.channel_id})
         else:
@@ -809,9 +1188,32 @@ class App(tk.Tk):
         self.main_frame.show_channels()
         self.main_frame.chat_view.show_placeholder()
         self.selected_channel = None
+        self._leave_voice_channel()
 
     def _select_user(self, username: Optional[str]) -> None:
         _ = username
+
+    def _enter_voice_channel(self, channel: Channel) -> None:
+        self.voice_channel = channel
+        self.main_frame.chat_view.show_voice_panel()
+        self.voice_members = []
+        self.voice_activity.clear()
+        self.main_frame.chat_view.update_voice_participants([])
+        if channel.channel_type == "room":
+            self.client.send({"action": "list_members", "room": channel.channel_id})
+        else:
+            self.client.send({"action": "list_members", "chat": channel.channel_id})
+        self._start_voice_stream()
+
+    def _leave_voice_channel(self) -> None:
+        self.voice_channel = None
+        self.voice_members = []
+        self.voice_activity.clear()
+        self.main_frame.chat_view.hide_voice_panel()
+        self.main_frame.chat_view.voice_panel.set_screen_enabled(False)
+        self.main_frame.chat_view.voice_panel.set_mic_enabled(False)
+        self._stop_voice_stream()
+        self._stop_screen_share()
 
     def _create_room(self, room: str, kind: str) -> None:
         self.client.send({"action": "create_room", "room": room, "kind": kind})
@@ -832,6 +1234,161 @@ class App(tk.Tk):
             return
         self.client.send({"action": "invite_room", "room": room, "username": username})
 
+    def _handle_member_list(self, message: dict[str, Any]) -> None:
+        if not self.voice_channel:
+            return
+        target = message.get("target")
+        expected = self._channel_target(self.voice_channel)
+        if target != expected:
+            return
+        members = message.get("members", [])
+        if isinstance(members, list):
+            self.voice_members = members
+            self.main_frame.chat_view.update_voice_participants(members)
+
+    def _handle_media_message(self, message: dict[str, Any]) -> None:
+        action = message.get("action")
+        if action == "media_connection_closed":
+            self.login_frame.set_status("Медиа-соединение закрыто.")
+            return
+        if action == "voice_chunk":
+            sender = message.get("from")
+            target = message.get("target")
+            if not self.voice_channel or target != self._channel_target(self.voice_channel):
+                return
+            audio = message.get("audio")
+            if not sender or not audio:
+                return
+            try:
+                decoded = base64.b64decode(audio)
+            except (ValueError, TypeError):
+                return
+            if self.voice_engine is not None:
+                self.voice_engine.enqueue_output(decoded)
+            self._note_voice_activity(sender)
+        elif action == "screen_frame":
+            sender = message.get("from")
+            target = message.get("target")
+            if not sender or not target:
+                return
+            if not self.voice_channel or target != self._channel_target(self.voice_channel):
+                return
+            frame = message.get("frame")
+            if not frame:
+                return
+            self._show_screen_frame(target, sender, frame)
+
+    def _note_voice_activity(self, username: str) -> None:
+        self.voice_activity[username] = time.time()
+
+    def _tick_voice_activity(self) -> None:
+        now = time.time()
+        for username in self.voice_members:
+            last_active = self.voice_activity.get(username, 0)
+            active = now - last_active <= 1.0
+            self.main_frame.chat_view.set_voice_activity(username, active)
+        self.after(200, self._tick_voice_activity)
+
+    def _start_voice_stream(self) -> None:
+        if self.voice_engine is None:
+            self.main_frame.chat_view.voice_panel.set_notice(
+                "Аудио недоступно: установите sounddevice."
+            )
+            self.main_frame.chat_view.voice_panel.set_mic_enabled(False)
+            return
+        self.voice_engine.set_device(self.selected_input_device)
+        self.voice_engine.on_audio_chunk = self._send_voice_chunk
+        self.voice_engine.set_muted(False)
+        self.main_frame.chat_view.voice_panel.set_mic_enabled(True)
+        self.voice_engine.start_input()
+
+    def _stop_voice_stream(self) -> None:
+        if self.voice_engine is None:
+            return
+        self.voice_engine.stop_input()
+        self.voice_engine.stop_output()
+
+    def _send_voice_chunk(self, data: bytes, level: float) -> None:
+        if not self.voice_channel:
+            return
+        if level > 0.02 and self.username:
+            self._note_voice_activity(self.username)
+        payload: dict[str, Any] = {
+            "action": "voice_chunk",
+            "audio": base64.b64encode(data).decode("utf-8"),
+            "target": self._channel_target(self.voice_channel),
+            "sample_rate": self.voice_engine.sample_rate if self.voice_engine else 16000,
+        }
+        self.media_client.send(payload)
+
+    def _toggle_mic(self, enabled: bool) -> None:
+        if self.voice_engine is None:
+            return
+        self.voice_engine.set_muted(not enabled)
+
+    def _select_input_device(self, device_index: Optional[int]) -> None:
+        self.selected_input_device = device_index
+        if self.voice_engine is not None:
+            self.voice_engine.set_device(device_index)
+
+    def _toggle_screen_share(self, enabled: bool) -> None:
+        if enabled:
+            self._start_screen_share()
+        else:
+            self._stop_screen_share()
+
+    def _start_screen_share(self) -> None:
+        if imagegrab_module is None:
+            self.main_frame.chat_view.voice_panel.set_notice(
+                "Демонстрация экрана недоступна: установите Pillow."
+            )
+            self.main_frame.chat_view.voice_panel.set_screen_enabled(False)
+            return
+        if not self.voice_channel:
+            return
+        self.screen_sharing = True
+        self.screen_share_target = self._channel_target(self.voice_channel)
+        self._send_screen_frame()
+
+    def _stop_screen_share(self) -> None:
+        self.screen_sharing = False
+        if self.screen_share_job:
+            self.after_cancel(self.screen_share_job)
+            self.screen_share_job = None
+        self.screen_share_target = None
+
+    def _send_screen_frame(self) -> None:
+        if not self.screen_sharing or not self.screen_share_target:
+            return
+        grabber = imagegrab_module
+        if grabber is None:
+            return
+        image = grabber.grab()
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        self.media_client.send(
+            {
+                "action": "screen_frame",
+                "frame": encoded,
+                "target": self.screen_share_target,
+            }
+        )
+        self.screen_share_job = self.after(1000, self._send_screen_frame)
+
+    def _show_screen_frame(self, target: str, sender: str, frame: str) -> None:
+        key = (target, sender)
+        window = self.screen_windows.get(key)
+        if window is None or not window.winfo_exists():
+            window = tk.Toplevel(self)
+            window.title(f"Screen share: {sender}")
+            label = ttk.Label(window)
+            label.pack(fill="both", expand=True)
+            window.label = label  # type: ignore[attr-defined]
+            self.screen_windows[key] = window
+        photo = tk.PhotoImage(data=frame)
+        window.label.configure(image=photo)  # type: ignore[attr-defined]
+        window.label.image = photo  # type: ignore[attr-defined]
     def _accept_invite(self, invite: Invite) -> None:
         if invite.invite_type == "room":
             self.client.send({"action": "join_room", "room": invite.target})
@@ -904,10 +1461,10 @@ class App(tk.Tk):
 
 
 def main() -> None:
-    config = ClientConfig(
-        host=os.getenv("RCORD_HOST", "127.0.0.1"),
-        port=int(os.getenv("RCORD_PORT", "8765")),
-    )
+    host = os.getenv("RCORD_HOST", "127.0.0.1")
+    port = int(os.getenv("RCORD_PORT", "8765"))
+    media_port = int(os.getenv("RCORD_MEDIA_PORT", str(port + 1)))
+    config = ClientConfig(host=host, port=port, media_port=media_port)
     app = App(config)
     app.mainloop()
 
