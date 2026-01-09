@@ -706,6 +706,38 @@ class RCordApp:
                 self.handle_invite(message)
             except AttributeError:
                 messagebox.showinfo("Invite", f"Получено приглашение: {message}")
+        elif action == "join_room":
+            if message.get("ok"):
+                room = message.get("room")
+                kind = message.get("kind", "text")
+                if room:
+                    self.current_target = {"room": room, "kind": kind}
+                    self.center_panel.update_title(f"Room: {room}")
+                    self.refresh_messages()
+                    self.refresh_members()
+                    if kind == "voice":
+                        self.show_voice_view()
+                    else:
+                        self.show_text_view()
+                self.refresh_rooms()
+            else:
+                messagebox.showerror("Join room failed", message.get("error", "Unknown error"))
+        elif action == "accept_chat":
+            if message.get("ok"):
+                chat_id = message.get("chat")
+                kind = message.get("kind", "text")
+                if chat_id:
+                    self.current_target = {"chat": chat_id, "kind": kind}
+                    self.center_panel.update_title(f"Chat: {chat_id}")
+                    self.refresh_messages()
+                    self.refresh_members()
+                    if kind == "voice":
+                        self.show_voice_view()
+                    else:
+                        self.show_text_view()
+                self.refresh_chats()
+            else:
+                messagebox.showerror("Join chat failed", message.get("error", "Unknown error"))
         elif action == "send_message":
             self.refresh_messages()
         elif action == "heartbeat":
@@ -1080,8 +1112,7 @@ class RCordApp:
                 f"Приглашение в комнату '{room}' ({kind}) от {sender}. Принять?",
             )
             if accept:
-                if self.safe_send({"action": "join_room", "room": room}):
-                    self.refresh_rooms()
+                self.safe_send({"action": "join_room", "room": room})
             else:
                 self.safe_send({"action": "decline_room_invite", "room": room})
         elif invite_type == "chat":
@@ -1093,8 +1124,7 @@ class RCordApp:
                 f"Приглашение в чат '{chat_id}' от {sender}. Принять?",
             )
             if accept:
-                if self.safe_send({"action": "accept_chat", "chat": chat_id}):
-                    self.refresh_chats()
+                self.safe_send({"action": "accept_chat", "chat": chat_id})
             else:
                 self.safe_send({"action": "decline_chat_invite", "chat": chat_id})
 
