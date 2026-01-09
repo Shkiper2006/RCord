@@ -330,6 +330,11 @@ class Storage:
         room_data = data["rooms"].get(room, {})
         return sorted(room_data.get("members", []))
 
+    def get_chat_members(self, chat_id: str) -> List[str]:
+        data = self._read()
+        chat = data["chats"].get(chat_id, {})
+        return sorted(chat.get("participants", []))
+
     def get_room_kind(self, room: str) -> str:
         data = self._read()
         return data["rooms"].get(room, {}).get("kind", "text")
