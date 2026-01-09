@@ -582,7 +582,10 @@ async def main() -> None:
         stop_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _stop)
+        try:
+            loop.add_signal_handler(sig, _stop)
+        except NotImplementedError:
+            pass
 
     monitor_task = asyncio.create_task(monitor_sessions(state))
     addr = ", ".join(str(sock.getsockname()) for sock in server.sockets or [])
