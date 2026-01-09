@@ -1114,6 +1114,8 @@ class App(tk.Tk):
         self.main_frame.channel_list.update_rooms(room_channels)
         self.main_frame.channel_list.update_chats(chat_channels)
         self.main_frame.invite_room_combo["values"] = [room["room"] for room in self.rooms]
+        if self.selected_channel is None:
+            self.main_frame.show_channels()
 
     def _chat_label(self, chat_id: str, kind: str) -> str:
         if self.username and ":" in chat_id:
