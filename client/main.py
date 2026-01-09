@@ -702,7 +702,7 @@ class RCordApp:
         elif action == "list_messages":
             self.update_messages(message.get("messages", []))
         elif action == "invite_received":
-            messagebox.showinfo("Invite", f"Получено приглашение: {message}")
+            self.handle_invite(message)
         elif action == "send_message":
             self.refresh_messages()
         elif action == "heartbeat":
