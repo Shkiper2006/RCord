@@ -19,6 +19,11 @@ python main.py
 
 The server will create `DB.dat` on first start in the current working directory.
 
+`DB.dat` is a JSON file with an integrity checksum and metadata. The file uses a
+top-level object with `format`, `version`, `data`, and `checksum` fields. The
+`data` object stores users, rooms, chats, messages, invites, and status entries.
+Older files that only contain the `data` object are still supported.
+
 ## Protocol
 
 All messages are newline-delimited JSON objects (`\n` terminated). Example:

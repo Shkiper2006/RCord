@@ -30,6 +30,7 @@ class ServerState:
     def set_online(self, username: str, writer: asyncio.StreamWriter) -> None:
         self.sessions[username] = Session(username=username, writer=writer)
         self.status[username] = {"online": True, "last_seen": utc_now()}
+        self.storage.set_status(username, True, self.status[username]["last_seen"])
 
     def set_offline(self, username: str) -> None:
         if username in self.sessions:
@@ -39,11 +40,13 @@ class ServerState:
             if writer:
                 writer.close()
         self.status[username] = {"online": False, "last_seen": utc_now()}
+        self.storage.set_status(username, False, self.status[username]["last_seen"])
 
     def touch(self, username: str) -> None:
         entry = self.status.setdefault(username, {"online": True, "last_seen": utc_now()})
         entry["online"] = True
         entry["last_seen"] = utc_now()
+        self.storage.set_status(username, True, entry["last_seen"])
 
     def list_users_with_status(self) -> list[dict[str, Any]]:
         users = []
@@ -554,6 +557,7 @@ async def monitor_sessions(state: ServerState) -> None:
 async def main() -> None:
     storage = Storage(StorageConfig(path=DB_PATH))
     state = ServerState(storage=storage)
+    state.status = storage.get_statuses()
     server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, state), HOST, PORT
     )

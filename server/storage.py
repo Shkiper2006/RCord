@@ -3,6 +3,7 @@ import os
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
 from typing import Any, Dict, List, Optional
 
 
@@ -26,26 +27,77 @@ class Storage:
         self._lock = threading.Lock()
         self._ensure_file()
 
+    @staticmethod
+    def _default_data() -> Dict[str, Any]:
+        return {
+            "users": {},
+            "rooms": {},
+            "chats": {},
+            "messages": {},
+            "invites": {"users": {}},
+            "status": {},
+        }
+
+    @staticmethod
+    def _checksum_payload(data: Dict[str, Any]) -> str:
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return sha256(payload.encode("utf-8")).hexdigest()
+
+    def _normalize_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("DB.dat must contain a JSON object")
+        normalized = self._default_data()
+        normalized["users"] = data.get("users", {}) if isinstance(data.get("users", {}), dict) else {}
+        normalized["rooms"] = data.get("rooms", {}) if isinstance(data.get("rooms", {}), dict) else {}
+        normalized["chats"] = data.get("chats", {}) if isinstance(data.get("chats", {}), dict) else {}
+        normalized["messages"] = (
+            data.get("messages", {}) if isinstance(data.get("messages", {}), dict) else {}
+        )
+        invites = data.get("invites", {}) if isinstance(data.get("invites", {}), dict) else {}
+        normalized["invites"] = {
+            "users": invites.get("users", {}) if isinstance(invites.get("users", {}), dict) else {}
+        }
+        normalized["status"] = data.get("status", {}) if isinstance(data.get("status", {}), dict) else {}
+        for username, info in normalized["users"].items():
+            if username not in normalized["status"]:
+                last_seen = None
+                if isinstance(info, dict):
+                    last_seen = info.get("created_at")
+                normalized["status"][username] = {"online": False, "last_seen": last_seen}
+        return normalized
+
     def _ensure_file(self) -> None:
         if not os.path.exists(self._path):
-            self._write(
-                {
-                    "users": {},
-                    "rooms": {},
-                    "chats": {},
-                    "messages": {},
-                    "invites": {"users": {}},
-                }
-            )
+            self._write(self._default_data())
 
     def _read(self) -> Dict[str, Any]:
         with open(self._path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
+            raw = json.load(handle)
+        if isinstance(raw, dict) and "data" in raw:
+            data = raw.get("data", {})
+            checksum = raw.get("checksum")
+            if checksum:
+                expected = self._checksum_payload(data)
+                if checksum != expected:
+                    raise ValueError("DB.dat integrity check failed")
+            return self._normalize_data(data)
+        return self._normalize_data(raw)
 
     def _write(self, data: Dict[str, Any]) -> None:
+        normalized = self._normalize_data(data)
         temp_path = f"{self._path}.tmp"
         with open(temp_path, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=2)
+            json.dump(
+                {
+                    "format": "rcord-db",
+                    "version": 1,
+                    "data": normalized,
+                    "checksum": self._checksum_payload(normalized),
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
         os.replace(temp_path, self._path)
 
     def register_user(self, username: str, password: str) -> bool:
@@ -58,6 +110,7 @@ class Storage:
                 "created_at": utc_now(),
             }
             data["invites"]["users"].setdefault(username, {"rooms": [], "chats": []})
+            data["status"][username] = {"online": False, "last_seen": utc_now()}
             self._write(data)
             return True
 
@@ -298,6 +351,24 @@ class Storage:
             messages = data["messages"].setdefault(target, [])
             message = {"sender": sender, "ts": utc_now(), **payload}
             messages.append(message)
+            self._write(data)
+
+    def get_statuses(self) -> Dict[str, Dict[str, Any]]:
+        data = self._read()
+        return {key: dict(value) for key, value in data.get("status", {}).items()}
+
+    def set_status(self, username: str, online: bool, last_seen: Optional[str] = None) -> None:
+        with self._lock:
+            data = self._read()
+            entry = data["status"].setdefault(username, {"online": False, "last_seen": None})
+            entry["online"] = online
+            entry["last_seen"] = last_seen or utc_now()
+            self._write(data)
+
+    def set_statuses(self, statuses: Dict[str, Dict[str, Any]]) -> None:
+        with self._lock:
+            data = self._read()
+            data["status"] = statuses
             self._write(data)
 
     def list_messages(self, target: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
