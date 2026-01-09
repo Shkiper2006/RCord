@@ -292,11 +292,12 @@ class Storage:
                 return True
         return False
 
-    def add_message(self, target: str, sender: str, text: str) -> None:
+    def add_message(self, target: str, sender: str, payload: Dict[str, Any]) -> None:
         with self._lock:
             data = self._read()
             messages = data["messages"].setdefault(target, [])
-            messages.append({"sender": sender, "text": text, "ts": utc_now()})
+            message = {"sender": sender, "ts": utc_now(), **payload}
+            messages.append(message)
             self._write(data)
 
     def list_messages(self, target: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:

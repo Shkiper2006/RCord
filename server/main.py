@@ -330,10 +330,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     continue
                 room = message.get("room")
                 chat = message.get("chat")
+                kind = message.get("kind", "text")
                 text = message.get("text")
-                if not text:
-                    await send(writer, {"ok": False, "error": "missing_text"})
-                    continue
+                filename = message.get("filename")
+                content = message.get("content")
                 if room:
                     if not state.storage.room_has_member(room, username):
                         await send(writer, {"ok": False, "error": "not_room_member"})
@@ -347,8 +347,21 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 else:
                     await send(writer, {"ok": False, "error": "missing_target"})
                     continue
-                state.storage.add_message(target, username, text)
-                await send(writer, {"ok": True, "action": "send_message", "target": target})
+                if kind == "text":
+                    if not text:
+                        await send(writer, {"ok": False, "error": "missing_text"})
+                        continue
+                    payload = {"kind": "text", "text": text}
+                elif kind in ("file", "image"):
+                    if not filename or not content:
+                        await send(writer, {"ok": False, "error": "missing_attachment"})
+                        continue
+                    payload = {"kind": kind, "filename": filename, "content": content}
+                else:
+                    await send(writer, {"ok": False, "error": "unknown_message_kind"})
+                    continue
+                state.storage.add_message(target, username, payload)
+                await send(writer, {"ok": True, "action": "send_message", "target": target, "kind": kind})
             elif action == "list_messages":
                 if not username:
                     await send(writer, {"ok": False, "error": "not_authenticated"})
