@@ -1012,6 +1012,8 @@ class App(tk.Tk):
                 if room:
                     self.rooms.append({"room": room, "kind": kind})
                     self._refresh_channel_lists()
+                    self.main_frame.show_channels()
+                    self.client.send({"action": "list_rooms"})
         elif action == "join_room":
             if message.get("ok"):
                 room = message.get("room")
@@ -1019,6 +1021,8 @@ class App(tk.Tk):
                 if room and not any(item.get("room") == room for item in self.rooms):
                     self.rooms.append({"room": room, "kind": kind})
                     self._refresh_channel_lists()
+                    self.main_frame.show_channels()
+                    self.client.send({"action": "list_rooms"})
         elif action == "create_chat":
             if message.get("ok"):
                 chat = message.get("chat")
