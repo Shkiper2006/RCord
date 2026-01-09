@@ -1050,6 +1050,8 @@ class App(tk.Tk):
     def _show_main(self) -> None:
         self.login_frame.pack_forget()
         self.main_frame.pack(fill="both", expand=True)
+        self.main_frame.show_channels()
+        self.main_frame.chat_view.show_placeholder()
 
     def _show_login(self) -> None:
         self.main_frame.pack_forget()
