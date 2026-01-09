@@ -5,6 +5,7 @@ import socket
 import threading
 import tkinter as tk
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from tkinter import ttk
 from typing import Any, Callable, Optional
 
@@ -124,36 +125,262 @@ class LoginFrame(ttk.Frame):
 
 
 class UserList(ttk.Frame):
-    def __init__(self, master: tk.Misc) -> None:
+    def __init__(self, master: tk.Misc, on_select: Callable[[Optional[str]], None]) -> None:
         super().__init__(master)
+        self.on_select = on_select
         ttk.Label(self, text="Users", font=("TkDefaultFont", 11, "bold")).pack(
             anchor="w", pady=(0, 8)
         )
-        self.list_frame = ttk.Frame(self)
-        self.list_frame.pack(fill="both", expand=True)
-        self.rows: dict[str, ttk.Frame] = {}
+        self.listbox = tk.Listbox(self, height=12)
+        self.listbox.pack(fill="both", expand=True)
+        self.listbox.bind("<<ListboxSelect>>", self._handle_select)
+        self.user_map: list[str] = []
 
     def update_users(self, users: list[dict[str, Any]]) -> None:
+        self.listbox.delete(0, tk.END)
+        self.user_map = []
+        for user in users:
+            username = user.get("username", "")
+            status = "online" if user.get("online") else "offline"
+            self.listbox.insert(tk.END, f"{username} ({status})")
+            self.user_map.append(username)
+
+    def selected_user(self) -> Optional[str]:
+        selection = self.listbox.curselection()
+        if not selection:
+            return None
+        index = selection[0]
+        if index >= len(self.user_map):
+            return None
+        return self.user_map[index]
+
+    def _handle_select(self, event: tk.Event) -> None:
+        _ = event
+        self.on_select(self.selected_user())
+
+
+@dataclass
+class Channel:
+    channel_type: str
+    channel_id: str
+    kind: str
+    label: str
+
+
+@dataclass
+class Invite:
+    invite_type: str
+    target: str
+    kind: str
+    invited_at: datetime
+    from_user: Optional[str] = None
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.invite_type, self.target)
+
+
+def parse_timestamp(value: Optional[str]) -> datetime:
+    if not value:
+        return datetime.now(timezone.utc)
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+class ChannelList(ttk.Frame):
+    def __init__(
+        self,
+        master: tk.Misc,
+        on_select: Callable[[Channel], None],
+        on_create_room: Callable[[str, str], None],
+    ) -> None:
+        super().__init__(master)
+        self.on_select = on_select
+        self.on_create_room = on_create_room
+        ttk.Label(self, text="Channels", font=("TkDefaultFont", 11, "bold")).pack(
+            anchor="w", pady=(0, 8)
+        )
+
+        self.rooms_label = ttk.Label(self, text="Rooms", font=("TkDefaultFont", 10, "bold"))
+        self.rooms_label.pack(anchor="w")
+        self.rooms_list = tk.Listbox(self, height=8)
+        self.rooms_list.pack(fill="x", pady=(4, 8))
+        self.rooms_list.bind("<<ListboxSelect>>", self._select_room)
+
+        create_frame = ttk.Frame(self)
+        create_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(create_frame, text="Room name").grid(row=0, column=0, sticky="w")
+        ttk.Label(create_frame, text="Type").grid(row=1, column=0, sticky="w")
+        self.room_name_var = tk.StringVar()
+        self.room_kind_var = tk.StringVar(value="text")
+        ttk.Entry(create_frame, textvariable=self.room_name_var).grid(
+            row=0, column=1, sticky="ew", padx=(6, 0)
+        )
+        ttk.Combobox(
+            create_frame, textvariable=self.room_kind_var, values=["text", "voice"], state="readonly"
+        ).grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(4, 0))
+        ttk.Button(create_frame, text="Create room", command=self._handle_create_room).grid(
+            row=2, column=0, columnspan=2, pady=(6, 0)
+        )
+        create_frame.columnconfigure(1, weight=1)
+
+        self.chats_label = ttk.Label(self, text="Chats", font=("TkDefaultFont", 10, "bold"))
+        self.chats_label.pack(anchor="w")
+        self.chats_list = tk.Listbox(self, height=8)
+        self.chats_list.pack(fill="x", pady=(4, 0))
+        self.chats_list.bind("<<ListboxSelect>>", self._select_chat)
+
+        self.rooms: list[Channel] = []
+        self.chats: list[Channel] = []
+
+    def update_rooms(self, rooms: list[Channel]) -> None:
+        self.rooms = rooms
+        self.rooms_list.delete(0, tk.END)
+        for channel in rooms:
+            self.rooms_list.insert(tk.END, channel.label)
+
+    def update_chats(self, chats: list[Channel]) -> None:
+        self.chats = chats
+        self.chats_list.delete(0, tk.END)
+        for channel in chats:
+            self.chats_list.insert(tk.END, channel.label)
+
+    def _select_room(self, event: tk.Event) -> None:
+        _ = event
+        selection = self.rooms_list.curselection()
+        if not selection:
+            return
+        channel = self.rooms[selection[0]]
+        self.on_select(channel)
+
+    def _select_chat(self, event: tk.Event) -> None:
+        _ = event
+        selection = self.chats_list.curselection()
+        if not selection:
+            return
+        channel = self.chats[selection[0]]
+        self.on_select(channel)
+
+    def _handle_create_room(self) -> None:
+        name = self.room_name_var.get().strip()
+        if not name:
+            return
+        kind = self.room_kind_var.get() or "text"
+        self.on_create_room(name, kind)
+        self.room_name_var.set("")
+
+
+class InviteList(ttk.Frame):
+    def __init__(
+        self,
+        master: tk.Misc,
+        on_accept: Callable[[Invite], None],
+        on_decline: Callable[[Invite], None],
+    ) -> None:
+        super().__init__(master)
+        self.on_accept = on_accept
+        self.on_decline = on_decline
+        ttk.Label(self, text="Invites", font=("TkDefaultFont", 11, "bold")).pack(
+            anchor="w", pady=(12, 8)
+        )
+        self.list_frame = ttk.Frame(self)
+        self.list_frame.pack(fill="both", expand=True)
+        self.rows: dict[tuple[str, str], ttk.Label] = {}
+
+    def render(self, invites: list[Invite]) -> None:
         for child in self.list_frame.winfo_children():
             child.destroy()
         self.rows.clear()
-        for user in users:
+        for invite in invites:
             row = ttk.Frame(self.list_frame)
-            row.pack(fill="x", pady=2)
-            dot = tk.Canvas(row, width=8, height=8, highlightthickness=0)
-            color = "#2ecc71" if user.get("online") else "#95a5a6"
-            dot.create_oval(2, 2, 6, 6, fill=color, outline=color)
-            dot.pack(side="left", padx=(0, 6))
-            ttk.Label(row, text=user.get("username", ""), anchor="w").pack(
-                side="left", fill="x", expand=True
+            row.pack(fill="x", pady=4)
+            label_text = self._invite_label(invite)
+            ttk.Label(row, text=label_text).pack(anchor="w")
+            timer = ttk.Label(row, text="")
+            timer.pack(anchor="w")
+            button_row = ttk.Frame(row)
+            button_row.pack(anchor="w", pady=(2, 0))
+            ttk.Button(button_row, text="Accept", command=lambda i=invite: self.on_accept(i)).pack(
+                side="left", padx=(0, 6)
             )
-            self.rows[user.get("username", "")] = row
+            ttk.Button(button_row, text="Decline", command=lambda i=invite: self.on_decline(i)).pack(
+                side="left"
+            )
+            self.rows[invite.key] = timer
+
+    def update_timer(self, invite: Invite, remaining: timedelta) -> None:
+        label = self.rows.get(invite.key)
+        if not label:
+            return
+        seconds = int(remaining.total_seconds())
+        minutes, secs = divmod(max(seconds, 0), 60)
+        label.configure(text=f"Time left: {minutes:02d}:{secs:02d}")
+
+    def _invite_label(self, invite: Invite) -> str:
+        if invite.invite_type == "room":
+            return f"Room: {invite.target} ({invite.kind})"
+        from_part = f" from {invite.from_user}" if invite.from_user else ""
+        return f"Chat: {invite.target} ({invite.kind}){from_part}"
+
+
+class ChatView(ttk.Frame):
+    def __init__(self, master: tk.Misc, on_show_channels: Callable[[], None]) -> None:
+        super().__init__(master)
+        header = ttk.Frame(self)
+        header.pack(fill="x")
+        self.title_var = tk.StringVar(value="Select a channel")
+        ttk.Label(header, textvariable=self.title_var, font=("TkDefaultFont", 12, "bold")).pack(
+            side="left"
+        )
+        self.show_channels_button = ttk.Button(
+            header, text="Список каналов", command=on_show_channels
+        )
+        self.show_channels_button.pack(side="right")
+        self.show_channels_button.pack_forget()
+
+        self.messages = tk.Listbox(self, height=18)
+        self.messages.pack(fill="both", expand=True, pady=(12, 0))
+
+    def show_placeholder(self) -> None:
+        self.title_var.set("Select a channel")
+        self.messages.delete(0, tk.END)
+        self.show_channels_button.pack_forget()
+
+    def show_channel(self, title: str) -> None:
+        self.title_var.set(title)
+        self.messages.delete(0, tk.END)
+        self.show_channels_button.pack(side="right")
+
+    def update_messages(self, messages: list[dict[str, Any]]) -> None:
+        self.messages.delete(0, tk.END)
+        for message in messages:
+            sender = message.get("sender", "")
+            text = message.get("text", "")
+            self.messages.insert(tk.END, f"{sender}: {text}")
 
 
 class MainFrame(ttk.Frame):
-    def __init__(self, master: tk.Misc) -> None:
+    def __init__(
+        self,
+        master: tk.Misc,
+        on_select_channel: Callable[[Channel], None],
+        on_create_room: Callable[[str, str], None],
+        on_show_channels: Callable[[], None],
+        on_select_user: Callable[[Optional[str]], None],
+        on_create_chat: Callable[[str, str], None],
+        on_invite_room: Callable[[str, str], None],
+        on_accept_invite: Callable[[Invite], None],
+        on_decline_invite: Callable[[Invite], None],
+    ) -> None:
         super().__init__(master)
-        self.user_list = UserList(self)
+        self.channel_list = ChannelList(self, on_select_channel, on_create_room)
+        self.chat_view = ChatView(self, on_show_channels)
+        self.user_list = UserList(self, on_select_user)
+        self.invite_list = InviteList(self, on_accept_invite, on_decline_invite)
+        self.on_create_chat = on_create_chat
+        self.on_invite_room = on_invite_room
 
         layout = ttk.Frame(self)
         layout.pack(fill="both", expand=True)
@@ -163,35 +390,68 @@ class MainFrame(ttk.Frame):
         layout.columnconfigure(2, weight=1)
         layout.rowconfigure(0, weight=1)
 
-        left = ttk.Frame(layout, padding=12)
+        self.left_frame = ttk.Frame(layout, padding=12)
         center = ttk.Frame(layout, padding=12)
         right = ttk.Frame(layout, padding=12)
 
-        left.grid(row=0, column=0, sticky="nsew")
+        self.left_frame.grid(row=0, column=0, sticky="nsew")
         center.grid(row=0, column=1, sticky="nsew")
         right.grid(row=0, column=2, sticky="nsew")
 
-        self.user_list.pack(in_=left, fill="both", expand=True)
+        self.channel_list.pack(in_=self.left_frame, fill="both", expand=True)
+        self.chat_view.pack(in_=center, fill="both", expand=True)
 
-        ttk.Label(
-            center,
-            text="Main chat area",
-            font=("TkDefaultFont", 12, "bold"),
-        ).pack(anchor="nw")
-        ttk.Label(
-            center,
-            text="Select a room or chat to view messages.",
-            foreground="#7f8c8d",
-        ).pack(anchor="nw", pady=(8, 0))
+        self.user_list.pack(in_=right, fill="x")
 
-        ttk.Label(right, text="Details", font=("TkDefaultFont", 11, "bold")).pack(
-            anchor="nw"
+        chat_controls = ttk.LabelFrame(right, text="New chat")
+        chat_controls.pack(fill="x", pady=(12, 0))
+        ttk.Label(chat_controls, text="Chat type").grid(row=0, column=0, sticky="w")
+        self.chat_kind_var = tk.StringVar(value="text")
+        ttk.Combobox(
+            chat_controls,
+            textvariable=self.chat_kind_var,
+            values=["text", "voice"],
+            state="readonly",
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        ttk.Button(chat_controls, text="Create chat", command=self._handle_create_chat).grid(
+            row=1, column=0, columnspan=2, pady=(6, 0)
         )
-        ttk.Label(
-            right,
-            text="Room info and actions will appear here.",
-            foreground="#7f8c8d",
-        ).pack(anchor="nw", pady=(8, 0))
+        chat_controls.columnconfigure(1, weight=1)
+
+        invite_controls = ttk.LabelFrame(right, text="Invite to room")
+        invite_controls.pack(fill="x", pady=(12, 0))
+        ttk.Label(invite_controls, text="Room").grid(row=0, column=0, sticky="w")
+        self.invite_room_var = tk.StringVar()
+        self.invite_room_combo = ttk.Combobox(
+            invite_controls, textvariable=self.invite_room_var, state="readonly"
+        )
+        self.invite_room_combo.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        ttk.Button(invite_controls, text="Send invite", command=self._handle_invite_room).grid(
+            row=1, column=0, columnspan=2, pady=(6, 0)
+        )
+        invite_controls.columnconfigure(1, weight=1)
+
+        self.invite_list.pack(in_=right, fill="both", expand=True)
+
+    def hide_channels(self) -> None:
+        self.left_frame.grid_remove()
+
+    def show_channels(self) -> None:
+        self.left_frame.grid()
+
+    def _handle_create_chat(self) -> None:
+        username = self.user_list.selected_user()
+        if not username:
+            return
+        kind = self.chat_kind_var.get() or "text"
+        self.on_create_chat(username, kind)
+
+    def _handle_invite_room(self) -> None:
+        username = self.user_list.selected_user()
+        room = self.invite_room_var.get()
+        if not username or not room:
+            return
+        self.on_invite_room(username, room)
 
 
 class App(tk.Tk):
@@ -203,15 +463,31 @@ class App(tk.Tk):
         self.queue: queue.Queue = queue.Queue()
         self.client = RcordClient(config, self.queue)
         self.username: Optional[str] = None
+        self.users: list[dict[str, Any]] = []
+        self.rooms: list[dict[str, Any]] = []
+        self.chats: list[dict[str, Any]] = []
+        self.invites: dict[tuple[str, str], Invite] = {}
 
         self.login_frame = LoginFrame(self, self._login, self._register)
-        self.main_frame = MainFrame(self)
+        self.main_frame = MainFrame(
+            self,
+            on_select_channel=self._select_channel,
+            on_create_room=self._create_room,
+            on_show_channels=self._show_channels,
+            on_select_user=self._select_user,
+            on_create_chat=self._create_chat,
+            on_invite_room=self._invite_room,
+            on_accept_invite=self._accept_invite,
+            on_decline_invite=self._decline_invite,
+        )
+        self.selected_channel: Optional[Channel] = None
 
         self.login_frame.pack(expand=True)
 
         self.after(200, self._process_queue)
         self.after(5000, self._refresh_users)
         self.after(30000, self._heartbeat)
+        self.after(1000, self._tick_invites)
 
     def _login(self, username: str, password: str) -> None:
         if not username or not password:
@@ -245,14 +521,62 @@ class App(tk.Tk):
             if message.get("ok"):
                 self.username = message.get("username") or self.login_frame.username_var.get()
                 users = message.get("users", [])
+                self.rooms = message.get("rooms", [])
+                self.chats = message.get("chats", [])
+                invites = message.get("invites", {})
                 self._show_main()
+                self.users = users
                 self.main_frame.user_list.update_users(users)
+                self._refresh_channel_lists()
+                self._load_invites(invites)
             else:
                 error = message.get("error", "Ошибка входа")
                 self.login_frame.set_status(f"Ошибка: {error}")
         elif action == "list_users":
             users = message.get("users", [])
+            self.users = users
             self.main_frame.user_list.update_users(users)
+        elif action == "list_rooms":
+            self.rooms = message.get("rooms", [])
+            self._refresh_channel_lists()
+        elif action == "list_chats":
+            self.chats = message.get("chats", [])
+            self._refresh_channel_lists()
+        elif action == "list_invites":
+            self._load_invites(message.get("invites", {}))
+        elif action == "invite_received":
+            self._handle_invite_received(message)
+        elif action == "create_room":
+            if message.get("ok"):
+                room = message.get("room")
+                kind = message.get("kind", "text")
+                if room:
+                    self.rooms.append({"room": room, "kind": kind})
+                    self._refresh_channel_lists()
+        elif action == "join_room":
+            if message.get("ok"):
+                room = message.get("room")
+                kind = message.get("kind", "text")
+                if room and not any(item.get("room") == room for item in self.rooms):
+                    self.rooms.append({"room": room, "kind": kind})
+                    self._refresh_channel_lists()
+        elif action == "create_chat":
+            if message.get("ok"):
+                chat = message.get("chat")
+                kind = message.get("kind", "text")
+                if chat and not any(item.get("chat") == chat for item in self.chats):
+                    self.chats.append({"chat": chat, "kind": kind})
+                    self._refresh_channel_lists()
+        elif action == "accept_chat":
+            if message.get("ok"):
+                chat = message.get("chat")
+                kind = message.get("kind", "text")
+                if chat and not any(item.get("chat") == chat for item in self.chats):
+                    self.chats.append({"chat": chat, "kind": kind})
+                    self._refresh_channel_lists()
+        elif action == "list_messages":
+            if self.selected_channel:
+                self.main_frame.chat_view.update_messages(message.get("messages", []))
         elif action == "connection_closed":
             self.login_frame.set_status("Соединение закрыто.")
             self.username = None
@@ -275,6 +599,171 @@ class App(tk.Tk):
         if self.username:
             self.client.send({"action": "heartbeat"})
         self.after(30000, self._heartbeat)
+
+    def _refresh_channel_lists(self) -> None:
+        room_channels = [
+            Channel(
+                channel_type="room",
+                channel_id=room["room"],
+                kind=room.get("kind", "text"),
+                label=f"#{room['room']} ({room.get('kind', 'text')})",
+            )
+            for room in self.rooms
+        ]
+        chat_channels = []
+        for chat in self.chats:
+            chat_id = chat["chat"]
+            kind = chat.get("kind", "text")
+            label = self._chat_label(chat_id, kind)
+            chat_channels.append(
+                Channel(channel_type="chat", channel_id=chat_id, kind=kind, label=label)
+            )
+        self.main_frame.channel_list.update_rooms(room_channels)
+        self.main_frame.channel_list.update_chats(chat_channels)
+        self.main_frame.invite_room_combo["values"] = [room["room"] for room in self.rooms]
+
+    def _chat_label(self, chat_id: str, kind: str) -> str:
+        if self.username and ":" in chat_id:
+            user_a, user_b = chat_id.split(":", 1)
+            other = user_b if user_a == self.username else user_a
+            return f"{other} ({kind})"
+        return f"{chat_id} ({kind})"
+
+    def _load_invites(self, invites_payload: dict[str, Any]) -> None:
+        new_invites: dict[tuple[str, str], Invite] = {}
+        for invite in invites_payload.get("rooms", []):
+            room = invite.get("room") if isinstance(invite, dict) else invite
+            invited_at = invite.get("invited_at") if isinstance(invite, dict) else None
+            if not room:
+                continue
+            new_invite = Invite(
+                invite_type="room",
+                target=room,
+                kind=invite.get("kind", "text") if isinstance(invite, dict) else "text",
+                invited_at=parse_timestamp(invited_at),
+            )
+            new_invites[new_invite.key] = new_invite
+        for invite in invites_payload.get("chats", []):
+            chat = invite.get("chat") if isinstance(invite, dict) else invite
+            invited_at = invite.get("invited_at") if isinstance(invite, dict) else None
+            if not chat:
+                continue
+            new_invite = Invite(
+                invite_type="chat",
+                target=chat,
+                kind=invite.get("kind", "text") if isinstance(invite, dict) else "text",
+                invited_at=parse_timestamp(invited_at),
+            )
+            new_invites[new_invite.key] = new_invite
+        self.invites = new_invites
+        self._refresh_invite_view()
+
+    def _handle_invite_received(self, message: dict[str, Any]) -> None:
+        invite_type = message.get("invite_type")
+        if invite_type == "room":
+            room = message.get("room")
+            if not room:
+                return
+            invite = Invite(
+                invite_type="room",
+                target=room,
+                kind=message.get("kind", "text"),
+                invited_at=parse_timestamp(message.get("invited_at")),
+                from_user=message.get("from"),
+            )
+        elif invite_type == "chat":
+            chat_id = message.get("chat")
+            if not chat_id:
+                return
+            invite = Invite(
+                invite_type="chat",
+                target=chat_id,
+                kind=message.get("kind", "text"),
+                invited_at=parse_timestamp(message.get("invited_at")),
+                from_user=message.get("from"),
+            )
+        else:
+            return
+        self.invites[invite.key] = invite
+        self._refresh_invite_view()
+
+    def _refresh_invite_view(self) -> None:
+        invites_sorted = sorted(self.invites.values(), key=lambda invite: invite.invited_at)
+        self.main_frame.invite_list.render(invites_sorted)
+        for invite in invites_sorted:
+            remaining = invite.invited_at + timedelta(minutes=5) - datetime.now(timezone.utc)
+            self.main_frame.invite_list.update_timer(invite, remaining)
+
+    def _tick_invites(self) -> None:
+        now = datetime.now(timezone.utc)
+        for invite in list(self.invites.values()):
+            remaining = invite.invited_at + timedelta(minutes=5) - now
+            if remaining.total_seconds() <= 0:
+                self._auto_decline(invite)
+            else:
+                self.main_frame.invite_list.update_timer(invite, remaining)
+        self.after(1000, self._tick_invites)
+
+    def _auto_decline(self, invite: Invite) -> None:
+        self.invites.pop(invite.key, None)
+        if invite.invite_type == "room":
+            self.client.send({"action": "decline_room_invite", "room": invite.target})
+        else:
+            self.client.send({"action": "decline_chat_invite", "chat": invite.target})
+        self._refresh_invite_view()
+
+    def _select_channel(self, channel: Channel) -> None:
+        self.selected_channel = channel
+        title = f"{channel.label}"
+        self.main_frame.chat_view.show_channel(title)
+        self.main_frame.hide_channels()
+        if channel.channel_type == "room":
+            self.client.send({"action": "list_messages", "room": channel.channel_id})
+        else:
+            self.client.send({"action": "list_messages", "chat": channel.channel_id})
+
+    def _show_channels(self) -> None:
+        self.main_frame.show_channels()
+        self.main_frame.chat_view.show_placeholder()
+        self.selected_channel = None
+
+    def _select_user(self, username: Optional[str]) -> None:
+        _ = username
+
+    def _create_room(self, room: str, kind: str) -> None:
+        self.client.send({"action": "create_room", "room": room, "kind": kind})
+
+    def _create_chat(self, username: str, kind: str) -> None:
+        if not self.username or username == self.username:
+            return
+        user_info = next((user for user in self.users if user.get("username") == username), None)
+        if not user_info or not user_info.get("online"):
+            return
+        self.client.send({"action": "create_chat", "username": username, "kind": kind})
+
+    def _invite_room(self, username: str, room: str) -> None:
+        if not self.username or username == self.username:
+            return
+        user_info = next((user for user in self.users if user.get("username") == username), None)
+        if not user_info or not user_info.get("online"):
+            return
+        self.client.send({"action": "invite_room", "room": room, "username": username})
+
+    def _accept_invite(self, invite: Invite) -> None:
+        if invite.invite_type == "room":
+            self.client.send({"action": "join_room", "room": invite.target})
+        else:
+            self.client.send({"action": "accept_chat", "chat": invite.target})
+        self.invites.pop(invite.key, None)
+        self._refresh_invite_view()
+
+    def _decline_invite(self, invite: Invite) -> None:
+        if invite.invite_type == "room":
+            self.client.send({"action": "decline_room_invite", "room": invite.target})
+        else:
+            self.client.send({"action": "decline_chat_invite", "chat": invite.target})
+        self.invites.pop(invite.key, None)
+        self._refresh_invite_view()
 
 
 def main() -> None:
