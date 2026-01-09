@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import queue
@@ -6,7 +7,7 @@ import threading
 import tkinter as tk
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from tkinter import ttk
+from tkinter import filedialog, ttk
 from typing import Any, Callable, Optional
 
 
@@ -326,8 +327,17 @@ class InviteList(ttk.Frame):
 
 
 class ChatView(ttk.Frame):
-    def __init__(self, master: tk.Misc, on_show_channels: Callable[[], None]) -> None:
+    def __init__(
+        self,
+        master: tk.Misc,
+        on_show_channels: Callable[[], None],
+        on_send_text: Callable[[str], None],
+        on_send_attachment: Callable[[str], None],
+    ) -> None:
         super().__init__(master)
+        self.on_send_text = on_send_text
+        self.on_send_attachment = on_send_attachment
+
         header = ttk.Frame(self)
         header.pack(fill="x")
         self.title_var = tk.StringVar(value="Select a channel")
@@ -343,22 +353,89 @@ class ChatView(ttk.Frame):
         self.messages = tk.Listbox(self, height=18)
         self.messages.pack(fill="both", expand=True, pady=(12, 0))
 
+        self.input_frame = ttk.Frame(self)
+        self.input_frame.pack(fill="x", pady=(12, 0))
+        self.message_var = tk.StringVar()
+        self.message_entry = ttk.Entry(self.input_frame, textvariable=self.message_var)
+        self.message_entry.pack(side="left", fill="x", expand=True)
+        self.message_entry.bind("<Return>", self._handle_send)
+        ttk.Button(self.input_frame, text="Send", command=self._handle_send).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(self.input_frame, text="File", command=self._handle_send_file).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(self.input_frame, text="Image", command=self._handle_send_image).pack(
+            side="left", padx=(6, 0)
+        )
+
+        self.emoji_frame = ttk.LabelFrame(self, text="Эмодзи")
+        self.emoji_frame.pack(fill="x", pady=(8, 0))
+        emojis = ["😀", "😂", "😍", "👍", "🎉", "😎", "🤝", "🔥", "🙌", "🥳"]
+        for emoji in emojis:
+            ttk.Button(
+                self.emoji_frame, text=emoji, width=3, command=lambda e=emoji: self._insert_emoji(e)
+            ).pack(side="left", padx=2, pady=2)
+
+        self.set_input_enabled(False)
+
+    def set_input_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        self.message_entry.configure(state=state)
+        for child in self.input_frame.winfo_children():
+            if isinstance(child, ttk.Button):
+                child.configure(state=state)
+        for child in self.emoji_frame.winfo_children():
+            if isinstance(child, ttk.Button):
+                child.configure(state=state)
+
+    def _insert_emoji(self, emoji: str) -> None:
+        self.message_entry.insert(tk.END, emoji)
+        self.message_entry.focus_set()
+
+    def _handle_send(self, event: Optional[tk.Event] = None) -> None:
+        _ = event
+        text = self.message_var.get().strip()
+        if not text:
+            return
+        self.on_send_text(text)
+        self.message_var.set("")
+
+    def _handle_send_file(self) -> None:
+        self.on_send_attachment("file")
+
+    def _handle_send_image(self) -> None:
+        self.on_send_attachment("image")
+
     def show_placeholder(self) -> None:
         self.title_var.set("Select a channel")
         self.messages.delete(0, tk.END)
         self.show_channels_button.pack_forget()
+        self.set_input_enabled(False)
 
     def show_channel(self, title: str) -> None:
         self.title_var.set(title)
         self.messages.delete(0, tk.END)
         self.show_channels_button.pack(side="right")
+        self.set_input_enabled(True)
 
     def update_messages(self, messages: list[dict[str, Any]]) -> None:
         self.messages.delete(0, tk.END)
         for message in messages:
             sender = message.get("sender", "")
-            text = message.get("text", "")
-            self.messages.insert(tk.END, f"{sender}: {text}")
+            kind = message.get("kind", "text")
+            if kind == "text":
+                text = message.get("text", "")
+                rendered = text
+            elif kind == "image":
+                filename = message.get("filename", "image")
+                rendered = f"[image] {filename}"
+            elif kind == "file":
+                filename = message.get("filename", "file")
+                rendered = f"[file] {filename}"
+            else:
+                rendered = message.get("text", "")
+            self.messages.insert(tk.END, f"{sender}: {rendered}")
 
 
 class MainFrame(ttk.Frame):
@@ -368,6 +445,8 @@ class MainFrame(ttk.Frame):
         on_select_channel: Callable[[Channel], None],
         on_create_room: Callable[[str, str], None],
         on_show_channels: Callable[[], None],
+        on_send_text: Callable[[str], None],
+        on_send_attachment: Callable[[str], None],
         on_select_user: Callable[[Optional[str]], None],
         on_create_chat: Callable[[str, str], None],
         on_invite_room: Callable[[str, str], None],
@@ -376,7 +455,7 @@ class MainFrame(ttk.Frame):
     ) -> None:
         super().__init__(master)
         self.channel_list = ChannelList(self, on_select_channel, on_create_room)
-        self.chat_view = ChatView(self, on_show_channels)
+        self.chat_view = ChatView(self, on_show_channels, on_send_text, on_send_attachment)
         self.user_list = UserList(self, on_select_user)
         self.invite_list = InviteList(self, on_accept_invite, on_decline_invite)
         self.on_create_chat = on_create_chat
@@ -474,6 +553,8 @@ class App(tk.Tk):
             on_select_channel=self._select_channel,
             on_create_room=self._create_room,
             on_show_channels=self._show_channels,
+            on_send_text=self._send_text_message,
+            on_send_attachment=self._send_attachment,
             on_select_user=self._select_user,
             on_create_chat=self._create_chat,
             on_invite_room=self._invite_room,
@@ -576,7 +657,9 @@ class App(tk.Tk):
                     self._refresh_channel_lists()
         elif action == "list_messages":
             if self.selected_channel:
-                self.main_frame.chat_view.update_messages(message.get("messages", []))
+                expected = self._channel_target(self.selected_channel)
+                if message.get("target") == expected:
+                    self.main_frame.chat_view.update_messages(message.get("messages", []))
         elif action == "connection_closed":
             self.login_frame.set_status("Соединение закрыто.")
             self.username = None
@@ -764,6 +847,60 @@ class App(tk.Tk):
             self.client.send({"action": "decline_chat_invite", "chat": invite.target})
         self.invites.pop(invite.key, None)
         self._refresh_invite_view()
+
+    def _channel_target(self, channel: Channel) -> str:
+        if channel.channel_type == "room":
+            return f"room:{channel.channel_id}"
+        return f"chat:{channel.channel_id}"
+
+    def _send_text_message(self, text: str) -> None:
+        if not self.selected_channel:
+            return
+        payload: dict[str, Any] = {"action": "send_message", "kind": "text", "text": text}
+        if self.selected_channel.channel_type == "room":
+            payload["room"] = self.selected_channel.channel_id
+        else:
+            payload["chat"] = self.selected_channel.channel_id
+        self.client.send(payload)
+        self.client.send(
+            {
+                "action": "list_messages",
+                self.selected_channel.channel_type: self.selected_channel.channel_id,
+            }
+        )
+
+    def _send_attachment(self, kind: str) -> None:
+        if not self.selected_channel:
+            return
+        if kind == "image":
+            filetypes = [
+                ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+                ("All files", "*.*"),
+            ]
+        else:
+            filetypes = [("All files", "*.*")]
+        path = filedialog.askopenfilename(title="Select file", filetypes=filetypes)
+        if not path:
+            return
+        with open(path, "rb") as handle:
+            encoded = base64.b64encode(handle.read()).decode("utf-8")
+        payload: dict[str, Any] = {
+            "action": "send_message",
+            "kind": kind,
+            "filename": os.path.basename(path),
+            "content": encoded,
+        }
+        if self.selected_channel.channel_type == "room":
+            payload["room"] = self.selected_channel.channel_id
+        else:
+            payload["chat"] = self.selected_channel.channel_id
+        self.client.send(payload)
+        self.client.send(
+            {
+                "action": "list_messages",
+                self.selected_channel.channel_type: self.selected_channel.channel_id,
+            }
+        )
 
 
 def main() -> None:

@@ -41,6 +41,12 @@ Supported actions:
 - `invite_room` `{room, username}`
 - `create_chat` `{username}`
 - `accept_chat` `{chat}`
-- `send_message` `{room|chat, text}`
+- `send_message` `{room|chat, kind, text? filename? content?}`
 - `list_messages` `{room|chat, limit?}`
 - `logout`
+
+Message kinds:
+
+- `text` uses `{text}`
+- `file` uses `{filename, content}` (base64)
+- `image` uses `{filename, content}` (base64)
