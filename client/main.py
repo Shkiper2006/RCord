@@ -1064,37 +1064,6 @@ class RCordApp:
             return
         messagebox.showinfo("Invite", f"Приглашение отправлено: {target}")
 
-    def handle_invite(self, message: Dict[str, Any]) -> None:
-        invite_type = message.get("invite_type")
-        sender = message.get("from", "unknown")
-        if invite_type == "room":
-            room = message.get("room")
-            kind = message.get("kind", "text")
-            if not room:
-                return
-            accept = messagebox.askyesno(
-                "Invite",
-                f"Приглашение в комнату '{room}' ({kind}) от {sender}. Принять?",
-            )
-            if accept:
-                if self.safe_send({"action": "join_room", "room": room}):
-                    self.refresh_rooms()
-            else:
-                self.safe_send({"action": "decline_room_invite", "room": room})
-        elif invite_type == "chat":
-            chat_id = message.get("chat")
-            if not chat_id:
-                return
-            accept = messagebox.askyesno(
-                "Invite",
-                f"Приглашение в чат '{chat_id}' от {sender}. Принять?",
-            )
-            if accept:
-                if self.safe_send({"action": "accept_chat", "chat": chat_id}):
-                    self.refresh_chats()
-            else:
-                self.safe_send({"action": "decline_chat_invite", "chat": chat_id})
-
     def safe_send(self, payload: Dict[str, Any]) -> bool:
         try:
             self.connection.send(payload)
