@@ -886,7 +886,7 @@ class App(tk.Tk):
         self.screen_share_job: Optional[str] = None
         self.screen_windows: dict[tuple[str, str], tk.Toplevel] = {}
 
-        self.login_frame = LoginFrame(self, self._login, self._register)
+        self.login_frame = LoginFrame(self, self._login, self._handle_register)
         self.main_frame = MainFrame(
             self,
             on_select_channel=self._select_channel,
@@ -919,7 +919,7 @@ class App(tk.Tk):
             return
         self.client.send({"action": "login", "username": username, "password": password})
 
-    def _register(self, username: str, password: str) -> None:
+    def _handle_register(self, username: str, password: str) -> None:
         if not username or not password:
             self.login_frame.set_status("Введите логин и пароль.")
             return
