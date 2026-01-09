@@ -594,6 +594,11 @@ class RCordApp:
         self.right_panel.grid(row=0, column=2, sticky="nsew", padx=(5, 10), pady=10)
         self.populate_audio_devices()
         self.update_media_controls_state()
+        if not SOUNDDEVICE_AVAILABLE:
+            messagebox.showwarning(
+                "Sounddevice missing",
+                "Установите sounddevice для голосового чата: pip install sounddevice",
+            )
 
     def apply_login_payload(self, payload: Dict[str, Any]) -> None:
         self.update_rooms(payload.get("rooms", []))
@@ -890,6 +895,9 @@ class RCordApp:
         if not PIL_AVAILABLE:
             messagebox.showwarning("Screen share unavailable", "Установите Pillow для скринкаста.")
             return
+        if not self.current_media_target():
+            messagebox.showwarning("Screen share", "Перейдите в голосовую комнату или чат для демонстрации.")
+            return
         if self.screen_share_enabled:
             self.stop_screen_share()
         else:
@@ -899,6 +907,11 @@ class RCordApp:
         if not self.media_client or not PIL_AVAILABLE:
             return
         if self.screen_share_enabled:
+            return
+        try:
+            ImageGrab.grab()
+        except Exception as exc:
+            messagebox.showerror("Screen share error", str(exc))
             return
         self.screen_share_enabled = True
         self.center_panel.screen_button.configure(text="Stop share")
