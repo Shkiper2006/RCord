@@ -162,11 +162,20 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     await send(writer, {"ok": False, "error": "not_authenticated"})
                     continue
                 room = message.get("room")
+                kind = message.get("kind", "text")
                 if not room:
                     await send(writer, {"ok": False, "error": "missing_room"})
                     continue
-                created = state.storage.create_room(room, username)
-                await send(writer, {"ok": created, "action": "create_room", "room": room})
+                created = state.storage.create_room(room, username, kind=kind)
+                await send(
+                    writer,
+                    {
+                        "ok": created,
+                        "action": "create_room",
+                        "room": room,
+                        "kind": kind,
+                    },
+                )
             elif action == "join_room":
                 if not username:
                     await send(writer, {"ok": False, "error": "not_authenticated"})
@@ -175,12 +184,21 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 if not room:
                     await send(writer, {"ok": False, "error": "missing_room"})
                     continue
-                invites = state.storage.list_room_invites(username)
-                if room not in invites and not state.storage.room_has_member(room, username):
+                if not state.storage.has_room_invite(username, room) and not state.storage.room_has_member(
+                    room, username
+                ):
                     await send(writer, {"ok": False, "error": "invite_required"})
                     continue
                 joined = state.storage.add_room_member(room, username)
-                await send(writer, {"ok": joined, "action": "join_room", "room": room})
+                await send(
+                    writer,
+                    {
+                        "ok": joined,
+                        "action": "join_room",
+                        "room": room,
+                        "kind": state.storage.get_room_kind(room),
+                    },
+                )
             elif action == "invite_room":
                 if not username:
                     await send(writer, {"ok": False, "error": "not_authenticated"})
@@ -196,22 +214,64 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 if target not in state.storage.list_users():
                     await send(writer, {"ok": False, "error": "user_not_found"})
                     continue
-                invited = state.storage.invite_to_room(room, target)
-                await send(writer, {"ok": invited, "action": "invite_room", "room": room, "username": target})
+                invited_at = state.storage.invite_to_room(room, target)
+                invited = invited_at is not None
+                await send(
+                    writer,
+                    {
+                        "ok": invited,
+                        "action": "invite_room",
+                        "room": room,
+                        "username": target,
+                    },
+                )
+                if invited and target in state.sessions:
+                    await send(
+                        state.sessions[target].writer,
+                        {
+                            "action": "invite_received",
+                            "invite_type": "room",
+                            "room": room,
+                            "kind": state.storage.get_room_kind(room),
+                            "invited_at": invited_at,
+                            "from": username,
+                        },
+                    )
             elif action == "create_chat":
                 if not username:
                     await send(writer, {"ok": False, "error": "not_authenticated"})
                     continue
                 target = message.get("username")
+                kind = message.get("kind", "text")
                 if not target:
                     await send(writer, {"ok": False, "error": "missing_username"})
                     continue
                 if target not in state.storage.list_users():
                     await send(writer, {"ok": False, "error": "user_not_found"})
                     continue
-                chat_id = state.storage.create_chat(username, target)
-                state.storage.invite_to_chat(target, chat_id)
-                await send(writer, {"ok": True, "action": "create_chat", "chat": chat_id})
+                chat_id = state.storage.create_chat(username, target, kind=kind)
+                invited_at = state.storage.invite_to_chat(target, chat_id)
+                await send(
+                    writer,
+                    {
+                        "ok": True,
+                        "action": "create_chat",
+                        "chat": chat_id,
+                        "kind": kind,
+                    },
+                )
+                if invited_at and target in state.sessions:
+                    await send(
+                        state.sessions[target].writer,
+                        {
+                            "action": "invite_received",
+                            "invite_type": "chat",
+                            "chat": chat_id,
+                            "invited_at": invited_at,
+                            "from": username,
+                            "kind": kind,
+                        },
+                    )
             elif action == "accept_chat":
                 if not username:
                     await send(writer, {"ok": False, "error": "not_authenticated"})
@@ -221,7 +281,49 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     await send(writer, {"ok": False, "error": "missing_chat"})
                     continue
                 accepted = state.storage.accept_chat_invite(username, chat_id)
-                await send(writer, {"ok": accepted, "action": "accept_chat", "chat": chat_id})
+                await send(
+                    writer,
+                    {
+                        "ok": accepted,
+                        "action": "accept_chat",
+                        "chat": chat_id,
+                        "kind": state.storage.get_chat_kind(chat_id),
+                    },
+                )
+            elif action == "decline_room_invite":
+                if not username:
+                    await send(writer, {"ok": False, "error": "not_authenticated"})
+                    continue
+                room = message.get("room")
+                if not room:
+                    await send(writer, {"ok": False, "error": "missing_room"})
+                    continue
+                removed = state.storage.remove_room_invite(username, room)
+                await send(
+                    writer,
+                    {
+                        "ok": removed,
+                        "action": "decline_room_invite",
+                        "room": room,
+                    },
+                )
+            elif action == "decline_chat_invite":
+                if not username:
+                    await send(writer, {"ok": False, "error": "not_authenticated"})
+                    continue
+                chat_id = message.get("chat")
+                if not chat_id:
+                    await send(writer, {"ok": False, "error": "missing_chat"})
+                    continue
+                removed = state.storage.remove_chat_invite(username, chat_id)
+                await send(
+                    writer,
+                    {
+                        "ok": removed,
+                        "action": "decline_chat_invite",
+                        "chat": chat_id,
+                    },
+                )
             elif action == "send_message":
                 if not username:
                     await send(writer, {"ok": False, "error": "not_authenticated"})
