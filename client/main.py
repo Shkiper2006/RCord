@@ -5,6 +5,8 @@ import json
 import os
 import queue
 import socket
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -405,7 +407,7 @@ class CenterPanel(ttk.Frame):
 
         self.voice_controls = ttk.Frame(self.voice_frame, style="Panel.TFrame")
         self.voice_controls.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
-        for idx in range(6):
+        for idx in range(7):
             self.voice_controls.columnconfigure(idx, weight=1)
 
         ttk.Label(self.voice_controls, text="Input device", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
@@ -426,6 +428,11 @@ class CenterPanel(ttk.Frame):
             self.voice_controls, text="Share screen", command=self.app.toggle_screen_share
         )
         self.screen_button.grid(row=1, column=3, padx=6)
+
+        self.install_sound_button = ttk.Button(
+            self.voice_controls, text="Install sounddevice", command=self.app.install_sounddevice
+        )
+        self.install_sound_button.grid(row=1, column=4, padx=6)
 
         self.voice_grid = ttk.Frame(self.voice_frame, style="Panel.TFrame")
         self.voice_grid.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
@@ -638,8 +645,10 @@ class RCordApp:
     def update_media_controls_state(self) -> None:
         if not SOUNDDEVICE_AVAILABLE:
             self.center_panel.mic_button.state(["disabled"])
+            self.center_panel.install_sound_button.state(["!disabled"])
         else:
             self.center_panel.mic_button.state(["!disabled"])
+            self.center_panel.install_sound_button.state(["disabled"])
         if not PIL_AVAILABLE:
             self.center_panel.screen_button.state(["disabled"])
         else:
@@ -832,6 +841,26 @@ class RCordApp:
             self.stop_mic_stream()
         else:
             self.start_mic_stream()
+
+    def install_sounddevice(self) -> None:
+        if SOUNDDEVICE_AVAILABLE:
+            messagebox.showinfo("Sounddevice", "sounddevice уже установлен.")
+            return
+
+        def run_install() -> None:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "sounddevice"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                message = "sounddevice установлен. Перезапустите приложение."
+                self.root.after(0, lambda: messagebox.showinfo("Sounddevice", message))
+            else:
+                error = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+                self.root.after(0, lambda: messagebox.showerror("Sounddevice", error))
+
+        threading.Thread(target=run_install, daemon=True).start()
 
     def start_mic_stream(self) -> None:
         if not SOUNDDEVICE_AVAILABLE:
