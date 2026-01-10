@@ -5,6 +5,8 @@ import json
 import os
 import queue
 import socket
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -99,7 +101,11 @@ class ClientConnection:
         with self._lock:
             if not self.socket:
                 raise RuntimeError("Not connected")
-            self.socket.sendall(data)
+            try:
+                self.socket.sendall(data)
+            except OSError as exc:
+                self.disconnect()
+                raise RuntimeError(str(exc)) from exc
 
     def wait_for_action(self, action: str, timeout: float = 5.0) -> Optional[Dict[str, Any]]:
         deadline = time.time() + timeout
@@ -257,19 +263,65 @@ class RightPanel(ttk.Frame):
         self.columnconfigure(0, weight=1)
         ttk.Label(self, text="Members", style="Heading.TLabel").grid(row=0, column=0, sticky="w", padx=10, pady=10)
 
-        self.container = ttk.Frame(self, style="Panel.TFrame")
-        self.container.grid(row=1, column=0, sticky="nsew", padx=10)
+        self.members_container = ttk.Frame(self, style="Panel.TFrame")
+        self.members_container.grid(row=1, column=0, sticky="nsew", padx=10)
         self.rowconfigure(1, weight=1)
 
+        ttk.Label(self, text="All Users", style="Heading.TLabel").grid(row=2, column=0, sticky="w", padx=10, pady=8)
+
+        self.users_list = tk.Listbox(
+            self,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            highlightthickness=1,
+            highlightbackground=COLORS["border"],
+            selectbackground=COLORS["accent"],
+        )
+        self.users_list.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 6))
+        self.rowconfigure(3, weight=1)
+
+        self.invite_button = ttk.Button(self, text="Invite to room", command=self.app.invite_selected_user)
+        self.invite_button.grid(row=4, column=0, padx=10, pady=(0, 10), sticky="ew")
+        self._user_index: List[str] = []
+
     def update_members(self, members: List[Dict[str, Any]]) -> None:
-        for child in self.container.winfo_children():
+        for child in self.members_container.winfo_children():
             child.destroy()
         if not members:
-            ttk.Label(self.container, text="No members", style="Muted.TLabel").pack(anchor="w")
+            ttk.Label(self.members_container, text="No members", style="Muted.TLabel").pack(anchor="w")
             return
         for member in members:
-            row = MemberRow(self.container, member["username"], member["online"])
+            row = MemberRow(self.members_container, member["username"], member["online"])
             row.pack(anchor="w", pady=4)
+
+    def update_users(self, users: List[Dict[str, Any]]) -> None:
+        self.users_list.delete(0, tk.END)
+        self._user_index = []
+        if not users:
+            self.users_list.insert(tk.END, "No users")
+            self.users_list.itemconfig(0, foreground=COLORS["muted"])
+            return
+        for idx, user in enumerate(users):
+            username = user.get("username", "unknown")
+            online = user.get("online", False)
+            label = f"● {username}"
+            self.users_list.insert(tk.END, label)
+            foreground = COLORS["success"] if online else COLORS["muted"]
+            background = COLORS["panel_alt"] if online else COLORS["border"]
+            self.users_list.itemconfig(idx, foreground=foreground)
+            self.users_list.itemconfig(idx, background=background)
+            self.users_list.itemconfig(idx, selectforeground=foreground)
+            self.users_list.itemconfig(idx, selectbackground=background)
+            self._user_index.append(username)
+
+    def selected_user(self) -> Optional[str]:
+        selection = self.users_list.curselection()
+        if not selection:
+            return None
+        index = selection[0]
+        if index >= len(self._user_index):
+            return None
+        return self._user_index[index]
 
 
 class VoiceTile(tk.Frame):
@@ -355,7 +407,7 @@ class CenterPanel(ttk.Frame):
 
         self.voice_controls = ttk.Frame(self.voice_frame, style="Panel.TFrame")
         self.voice_controls.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
-        for idx in range(6):
+        for idx in range(7):
             self.voice_controls.columnconfigure(idx, weight=1)
 
         ttk.Label(self.voice_controls, text="Input device", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
@@ -376,6 +428,11 @@ class CenterPanel(ttk.Frame):
             self.voice_controls, text="Share screen", command=self.app.toggle_screen_share
         )
         self.screen_button.grid(row=1, column=3, padx=6)
+
+        self.install_sound_button = ttk.Button(
+            self.voice_controls, text="Install sounddevice", command=self.app.install_sounddevice
+        )
+        self.install_sound_button.grid(row=1, column=4, padx=6)
 
         self.voice_grid = ttk.Frame(self.voice_frame, style="Panel.TFrame")
         self.voice_grid.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
@@ -544,6 +601,11 @@ class RCordApp:
         self.right_panel.grid(row=0, column=2, sticky="nsew", padx=(5, 10), pady=10)
         self.populate_audio_devices()
         self.update_media_controls_state()
+        if not SOUNDDEVICE_AVAILABLE:
+            messagebox.showwarning(
+                "Sounddevice missing",
+                "Установите sounddevice для голосового чата: pip install sounddevice",
+            )
 
     def apply_login_payload(self, payload: Dict[str, Any]) -> None:
         self.update_rooms(payload.get("rooms", []))
@@ -583,8 +645,10 @@ class RCordApp:
     def update_media_controls_state(self) -> None:
         if not SOUNDDEVICE_AVAILABLE:
             self.center_panel.mic_button.state(["disabled"])
+            self.center_panel.install_sound_button.state(["!disabled"])
         else:
             self.center_panel.mic_button.state(["!disabled"])
+            self.center_panel.install_sound_button.state(["disabled"])
         if not PIL_AVAILABLE:
             self.center_panel.screen_button.state(["disabled"])
         else:
@@ -652,7 +716,42 @@ class RCordApp:
         elif action == "list_messages":
             self.update_messages(message.get("messages", []))
         elif action == "invite_received":
-            messagebox.showinfo("Invite", f"Получено приглашение: {message}")
+            try:
+                self.handle_invite(message)
+            except AttributeError:
+                messagebox.showinfo("Invite", f"Получено приглашение: {message}")
+        elif action == "join_room":
+            if message.get("ok"):
+                room = message.get("room")
+                kind = message.get("kind", "text")
+                if room:
+                    self.current_target = {"room": room, "kind": kind}
+                    self.center_panel.update_title(f"Room: {room}")
+                    self.refresh_messages()
+                    self.refresh_members()
+                    if kind == "voice":
+                        self.show_voice_view()
+                    else:
+                        self.show_text_view()
+                self.refresh_rooms()
+            else:
+                messagebox.showerror("Join room failed", message.get("error", "Unknown error"))
+        elif action == "accept_chat":
+            if message.get("ok"):
+                chat_id = message.get("chat")
+                kind = message.get("kind", "text")
+                if chat_id:
+                    self.current_target = {"chat": chat_id, "kind": kind}
+                    self.center_panel.update_title(f"Chat: {chat_id}")
+                    self.refresh_messages()
+                    self.refresh_members()
+                    if kind == "voice":
+                        self.show_voice_view()
+                    else:
+                        self.show_text_view()
+                self.refresh_chats()
+            else:
+                messagebox.showerror("Join chat failed", message.get("error", "Unknown error"))
         elif action == "send_message":
             self.refresh_messages()
         elif action == "heartbeat":
@@ -674,6 +773,7 @@ class RCordApp:
 
     def update_users(self, users: List[Dict[str, Any]]) -> None:
         self.users = {user["username"]: user for user in users}
+        self.right_panel.update_users(users)
         self.refresh_members()
 
     def update_members(self, members: List[str]) -> None:
@@ -742,6 +842,26 @@ class RCordApp:
         else:
             self.start_mic_stream()
 
+    def install_sounddevice(self) -> None:
+        if SOUNDDEVICE_AVAILABLE:
+            messagebox.showinfo("Sounddevice", "sounddevice уже установлен.")
+            return
+
+        def run_install() -> None:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "sounddevice"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                message = "sounddevice установлен. Перезапустите приложение."
+                self.root.after(0, lambda: messagebox.showinfo("Sounddevice", message))
+            else:
+                error = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+                self.root.after(0, lambda: messagebox.showerror("Sounddevice", error))
+
+        threading.Thread(target=run_install, daemon=True).start()
+
     def start_mic_stream(self) -> None:
         if not SOUNDDEVICE_AVAILABLE:
             return
@@ -804,6 +924,9 @@ class RCordApp:
         if not PIL_AVAILABLE:
             messagebox.showwarning("Screen share unavailable", "Установите Pillow для скринкаста.")
             return
+        if not self.current_media_target():
+            messagebox.showwarning("Screen share", "Перейдите в голосовую комнату или чат для демонстрации.")
+            return
         if self.screen_share_enabled:
             self.stop_screen_share()
         else:
@@ -813,6 +936,11 @@ class RCordApp:
         if not self.media_client or not PIL_AVAILABLE:
             return
         if self.screen_share_enabled:
+            return
+        try:
+            ImageGrab.grab()
+        except Exception as exc:
+            messagebox.showerror("Screen share error", str(exc))
             return
         self.screen_share_enabled = True
         self.center_panel.screen_button.configure(text="Stop share")
@@ -859,7 +987,8 @@ class RCordApp:
             if not room:
                 messagebox.showwarning("Missing", "Введите название комнаты.")
                 return
-            self.connection.send({"action": "create_room", "room": room, "kind": kind_var.get()})
+            if not self.safe_send({"action": "create_room", "room": room, "kind": kind_var.get()}):
+                return
             dialog.destroy()
             self.refresh_rooms()
 
@@ -916,7 +1045,8 @@ class RCordApp:
         if not text:
             return
         payload = {"action": "send_message", "kind": "text", "text": text, **self.current_target}
-        self.connection.send(payload)
+        if not self.safe_send(payload):
+            return
         self.center_panel.entry_var.set("")
 
     def send_file(self) -> None:
@@ -940,7 +1070,7 @@ class RCordApp:
             "content": content,
             **self.current_target,
         }
-        self.connection.send(payload)
+        self.safe_send(payload)
 
     def add_emoji(self) -> None:
         self.center_panel.entry_var.set(self.center_panel.entry_var.get() + " 😊")
@@ -994,6 +1124,59 @@ class RCordApp:
         except RuntimeError:
             return
         self.users_after_id = self.root.after(USERS_REFRESH_INTERVAL * 1000, self.schedule_users_refresh)
+
+    def invite_selected_user(self) -> None:
+        target = self.right_panel.selected_user()
+        if not target:
+            messagebox.showwarning("Invite", "Выберите пользователя.")
+            return
+        if not self.current_target or "room" not in self.current_target:
+            messagebox.showwarning("Invite", "Выберите комнату, чтобы пригласить пользователя.")
+            return
+        room = self.current_target["room"]
+        if target == self.username:
+            messagebox.showwarning("Invite", "Нельзя приглашать самого себя.")
+            return
+        if not self.safe_send({"action": "invite_room", "room": room, "username": target}):
+            return
+        messagebox.showinfo("Invite", f"Приглашение отправлено: {target}")
+
+    def handle_invite(self, message: Dict[str, Any]) -> None:
+        invite_type = message.get("invite_type")
+        sender = message.get("from", "unknown")
+        if invite_type == "room":
+            room = message.get("room")
+            kind = message.get("kind", "text")
+            if not room:
+                return
+            accept = messagebox.askyesno(
+                "Invite",
+                f"Приглашение в комнату '{room}' ({kind}) от {sender}. Принять?",
+            )
+            if accept:
+                self.safe_send({"action": "join_room", "room": room})
+            else:
+                self.safe_send({"action": "decline_room_invite", "room": room})
+        elif invite_type == "chat":
+            chat_id = message.get("chat")
+            if not chat_id:
+                return
+            accept = messagebox.askyesno(
+                "Invite",
+                f"Приглашение в чат '{chat_id}' от {sender}. Принять?",
+            )
+            if accept:
+                self.safe_send({"action": "accept_chat", "chat": chat_id})
+            else:
+                self.safe_send({"action": "decline_chat_invite", "chat": chat_id})
+
+    def safe_send(self, payload: Dict[str, Any]) -> bool:
+        try:
+            self.connection.send(payload)
+        except RuntimeError as exc:
+            messagebox.showerror("Connection error", str(exc))
+            return False
+        return True
 
     def on_close(self) -> None:
         self.stop_presence_tasks()
